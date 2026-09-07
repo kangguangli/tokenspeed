@@ -158,6 +158,12 @@ class AttnConfig:
     # per request) instead of Eagle/MTP's per-step single-token decode. Backends
     # use this to expand decode metadata to spec_num_tokens rows per request.
     draft_block_decode: bool = False
+    # One topology for target and continuation/MTP views; DCP does not add ranks.
+    dcp_size: int = 1
+    dcp_rank: int = 0
+    dcp_group: tuple[int, ...] = (0,)
+    dcp_comm_backend: str = "ag_rs"
+    dcp_reference_backend: str | None = None
     components: tuple[AttnComponentSpec, ...]
 
     def __post_init__(self):

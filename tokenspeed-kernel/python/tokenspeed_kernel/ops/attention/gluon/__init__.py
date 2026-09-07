@@ -290,6 +290,7 @@ if current_platform().is_amd:
             "cache_layout": frozenset({"fp8_swa_page_planar"}),
             "topk_layout": frozenset({"global_slots"}),
             "support_sink": frozenset({True}),
+            "return_lse": frozenset({False}),
             "has_extra": frozenset({True}),
             "has_extra_segment": frozenset({True}),
             "swa_selected_width": frozenset({128}),

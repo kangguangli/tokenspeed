@@ -211,8 +211,8 @@ def pool_to_cache_groups(pool: Any) -> list:
     # no fallback to pool-side copies of the same specs.
     contract = pool.arena.runtime_contract
     specs = contract.group_specs
-    counts = contract.group_page_counts
-    packing = contract.group_packing
+    counts = contract.virtual_block_counts
+    packing = contract.virtual_packing
     out = []
     for spec in specs:
         retention = _RETENTION_MAP.get(spec.retention)
@@ -244,6 +244,9 @@ def pool_to_cache_groups(pool: Any) -> list:
             retention=retention,
             family=family,
             cache_blocks_per_lcm_block=int(packing[spec.group_id]),
+            allocation_bucket_count=contract.group_address_spaces[
+                spec.group_id
+            ].allocation_bucket_count,
         )
         transfer_policy = spec.transfer_policy
         if transfer_policy is not None:

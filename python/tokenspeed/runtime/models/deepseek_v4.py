@@ -1440,11 +1440,12 @@ def _deepseek_v4_indexer_page_table(
     page_table = metadata.cache.compressed_page_table(
         compress_ratio,
         indexer_block_size,
+        indexer=True,
     )
     base_offsets = None
     if page_table is not metadata.cache.page_table:
         base_offsets = metadata.cache.block_table_base_offsets.get(
-            v4_compressed_kv_group_id(compress_ratio)
+            metadata.cache.compressed_group_id(compress_ratio, indexer=True)
         )
     return page_table, base_offsets
 
@@ -2353,7 +2354,7 @@ class DeepseekV4Compressor(nn.Module):
             memo.get(("compressed", self.compress_ratio)) if memo is not None else None
         )
         if compressed_hit is not None:
-            compressed_slots = compressed_hit
+            compressed_slots, compressed_write_mask = compressed_hit
         else:
             with nvtx_range(f"{profile_prefix}_compressed_slot_mapping"):
                 compressed_slots = cache_metadata.compressed_slot_mapping(
@@ -2370,8 +2371,16 @@ class DeepseekV4Compressor(nn.Module):
                     ),
                     is_valid_token=valid_token,
                 )
+                compressed_slots, compressed_write_mask = (
+                    cache_metadata.local_compressed_write_slots(
+                        compressed_slots, self.compress_ratio
+                    )
+                )
             if memo is not None:
-                memo[("compressed", self.compress_ratio)] = compressed_slots
+                memo[("compressed", self.compress_ratio)] = (
+                    compressed_slots,
+                    compressed_write_mask,
+                )
         with nvtx_range(f"{profile_prefix}_cache_insert"):
             insert = (
                 deepseek_v4_csa_compress_kv_cache_insert
@@ -2391,6 +2400,7 @@ class DeepseekV4Compressor(nn.Module):
                 cos_sin_cache=cos_sin_cache,
                 kv_cache_2d=pool.get_compressed_kv_buffer_2d(layer_index),
                 kv_slot_mapping=compressed_slots,
+                kv_write_mask=compressed_write_mask,
                 kv_cache_block_size=kv_cache_block_size,
                 compress_ratio=self.compress_ratio,
             )
@@ -2903,6 +2913,7 @@ class DeepseekV4Indexer(nn.Module):
                     ctx.forward_mode is not None and ctx.forward_mode.is_decode()
                 ),
                 is_valid_token=valid_token,
+                indexer=True,
             )
         with nvtx_range("indexer_cache_insert"):
             deepseek_v4_csa_indexer_cache_insert(

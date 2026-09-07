@@ -27,7 +27,7 @@ from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from itertools import pairwise
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import torch
 
@@ -39,6 +39,34 @@ if TYPE_CHECKING:
 # Planner/runtime limits, not model layout inputs.
 _MAX_LCM_BLOCK_BYTES = (1 << 63) - 1
 _MAX_KERNEL_PAGE_ID = (1 << 31) - 1
+
+CachePlacement = Literal["replicated", "virtual_block_cyclic"]
+
+
+@dataclass(frozen=True)
+class CacheGroupDeclaration:
+    """Declare a group's logical spec, local fields, and runtime placement.
+
+    Iteration projects only ``(spec, fields)`` for the physical planner.
+    Placement never changes field shapes or physical packing in ``pack``.
+    """
+
+    spec: CacheGroupSpec
+    fields: tuple[CacheFieldSpec, ...]
+    placement: CachePlacement = "replicated"
+
+    def __post_init__(self) -> None:
+        if self.placement not in ("replicated", "virtual_block_cyclic"):
+            raise ValueError(f"unsupported cache placement {self.placement!r}")
+
+    def __iter__(self):
+        yield self.spec
+        yield self.fields
+
+    def allocation_bucket_count(self, dcp_size: int) -> int:
+        """Return the integer placement buckets for the shared DCP topology."""
+        return dcp_size if self.placement == "virtual_block_cyclic" else 1
+
 
 # Byte width per cache dtype name. This module stays torch-free (pure integer
 # geometry, and the plan travels the PD wire as JSON), so dtypes are named by

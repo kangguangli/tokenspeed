@@ -40,6 +40,7 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
     V4_COMPRESSOR_STATE_ROWS_PER_PAGE,
     V4_COMPRESSOR_STATE_WINDOW_TOKENS,
     V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,
+    V4_INDEXER_KV_GROUP_ID,
     V4_KERNEL_BLOCK_ROWS,
     V4_SWA_KV_GROUP_ID,
     DeepseekV4CacheLayout,
@@ -58,6 +59,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
     CacheLayout,
+    pack,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupSpec,
@@ -226,12 +228,21 @@ class DeepseekV4Recipe(CacheRecipe):
     @property
     @override
     def max_padding_fraction(self) -> float:
-        return _MAX_PADDING_FRACTION
+        # Splitting a replicated indexer from compressed KV creates narrow
+        # groups that reuse the same parent planes. Padding is bounded by the
+        # exact DCP1 parent byte budget in check_layout, not by the old joined
+        # group's payload fraction.
+        return float("inf") if self.dcp_size > 1 else _MAX_PADDING_FRACTION
 
     # ---- groups: declared whole, one walk over the layers ----
 
     @override
     def groups(self) -> tuple[CacheGroupDeclaration, ...]:
+        return self._declare_groups(split_indexer=self.dcp_size > 1)
+
+    def _declare_groups(
+        self, *, split_indexer: bool
+    ) -> tuple[CacheGroupDeclaration, ...]:
         layout = self._cache_layout
         sliding_window = int(
             (
@@ -256,7 +267,7 @@ class DeepseekV4Recipe(CacheRecipe):
         swa_bytes = layout.swa_block_bytes(V4_KERNEL_BLOCK_ROWS)
         stride_alignment = layout.swa_token_stride
         ratio_counts = Counter(ratios)
-        declared: dict[str, tuple[CacheGroupSpec, tuple[CacheFieldSpec, ...]]] = {}
+        declared: dict[str, CacheGroupDeclaration] = {}
         # A group's plane numbering: one plane per layer that stores in it.
         occurrences: Counter[str] = Counter()
 
@@ -267,9 +278,14 @@ class DeepseekV4Recipe(CacheRecipe):
             fields are added, so the two halves cannot drift apart.
             """
             existing = declared.get(spec.group_id)
-            declared[spec.group_id] = (
-                spec if existing is None else existing[0],
-                (() if existing is None else existing[1]) + fields,
+            sharded = split_indexer and spec.group_id in (
+                v4_compressed_kv_group_id(4),
+                v4_compressed_kv_group_id(128),
+            )
+            declared[spec.group_id] = CacheGroupDeclaration(
+                spec if existing is None else existing.spec,
+                (() if existing is None else existing.fields) + fields,
+                "virtual_block_cyclic" if sharded else "replicated",
             )
 
         swa_spec = v4_swa_kv_spec(self.model_config.hf_config)
@@ -323,13 +339,18 @@ class DeepseekV4Recipe(CacheRecipe):
             if ratio != 4:
                 continue
 
-            # The indexer's K shares the compressed chain's group but sits on
-            # planes after every compressed tenant; its state is its own group.
+            # DCP keeps global indexer K replicated in an independent group.
+            # Its field rows and plane numbering retain the DCP1 geometry.
+            indexer_spec = (
+                replace(compressed_spec, group_id=V4_INDEXER_KV_GROUP_ID)
+                if split_indexer
+                else compressed_spec
+            )
             indexer_state_spec = v4_indexer_state_spec(c4_state_window=c4_window)
             indexer_state_slot = occurrences[indexer_state_spec.group_id]
             occurrences[indexer_state_spec.group_id] += 1
             declare(
-                compressed_spec,
+                indexer_spec,
                 CacheFieldSpec(
                     f"layer.{layer_id}.indexer_kv",
                     f"unit.{ratio_counts[4] + compressed_slot}",
@@ -357,13 +378,39 @@ class DeepseekV4Recipe(CacheRecipe):
             return groups
         policies = apply_pd_transfer_policies(tuple(spec for spec, _ in groups))
         return tuple(
-            (spec, fields) for spec, (_, fields) in zip(policies, groups, strict=True)
+            replace(declaration, spec=spec)
+            for spec, declaration in zip(policies, groups, strict=True)
         )
 
     # ---- packing: powers of two so every field stride stays aligned ----
 
     @override
     def packing(self, groups: tuple[CacheGroupDeclaration, ...]) -> Mapping[str, int]:
+        if self.dcp_size > 1:
+            # Preserve every original group's physical packing and plane
+            # budget. Fit the independent indexer into the planes it already
+            # occupied; its packing gain is a split-group effect, independent
+            # of DCP size, and must be reported separately from sharding.
+            baseline = self._replicated_layout
+            packing = dict(baseline.group_packing)
+            planes = dict(baseline.plane_bytes)
+            for declaration in groups:
+                if declaration.spec.group_id != V4_INDEXER_KV_GROUP_ID:
+                    continue
+                by_plane = Counter()
+                for field in declaration.fields:
+                    by_plane[field.plane_id] += field.payload_bytes
+                fit = min(
+                    planes[plane_id] // size for plane_id, size in by_plane.items()
+                )
+                packing[declaration.spec.group_id] = 1 << (fit.bit_length() - 1)
+            return packing
+        return self._power_of_two_packing(groups)
+
+    @staticmethod
+    def _power_of_two_packing(
+        groups: tuple[CacheGroupDeclaration, ...],
+    ) -> Mapping[str, int]:
         raw_bytes = {
             spec.group_id: sum(field.payload_bytes for field in fields)
             for spec, fields in groups
@@ -376,6 +423,17 @@ class DeepseekV4Recipe(CacheRecipe):
             for group_id, group_bytes in raw_bytes.items()
         }
 
+    @cached_property
+    def _replicated_layout(self) -> CacheLayout:
+        groups = self._declare_groups(split_indexer=False)
+        return pack(
+            groups,
+            prefix_granularity=self.prefix_granularity,
+            cache_blocks_per_lcm_block=self._power_of_two_packing(groups),
+            alignment=self.alignment,
+            max_padding_fraction=_MAX_PADDING_FRACTION,
+        )
+
     @override
     def check_layout(self, layout: CacheLayout) -> None:
         """Every group's CacheBlock span must divide the identity grain.
@@ -384,6 +442,13 @@ class DeepseekV4Recipe(CacheRecipe):
         the group's block span; a remainder would put two different token
         ranges on one page id.
         """
+        if self.dcp_size > 1 and (
+            layout.lcm_block_bytes != self._replicated_layout.lcm_block_bytes
+            or layout.plane_bytes != self._replicated_layout.plane_bytes
+        ):
+            raise ValueError(
+                "DeepSeek V4 DCP must preserve the DCP1 physical parent byte geometry"
+            )
         for spec in self._group_specs:
             if layout.prefix_granularity % spec.block_granularity:
                 raise ValueError(

@@ -44,7 +44,8 @@ class CacheBatchMetadata:
     Attributes:
         group_ids: Cache group IDs in runtime-contract order.
         num_requests: Number of request rows in each group table.
-        max_page_ids: Inclusive maximum page ID accepted for each group.
+        max_page_ids: Inclusive maximum scheduler block ID for each group;
+            DCP virtual IDs are validated before owner/local translation.
         block_granularity: Full-history table grain in tokens (equals the
             contract prefix_granularity by the 1:1 convention).
         full_attention_group_id: The unique ``family="history"`` +
@@ -85,7 +86,7 @@ class CacheBatchMetadata:
         max_page_ids = {
             group_id: require_positive_int(
                 f"max page ID for {group_id!r}",
-                contract.group_page_counts[group_id] - 1,
+                contract.group_address_spaces[group_id].virtual_block_count - 1,
             )
             for group_id in group_ids
         }

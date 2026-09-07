@@ -7,29 +7,43 @@
 # copies of the Software, and to permit persons to whom the Software is
 # furnished to do so, subject to the following conditions:
 #
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
 # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 # IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import ClassVar
 
 import torch
 from tokenspeed_kernel.ops.attention.triton.dsv4 import dsv4_compressed_slot_mapping
+from tokenspeed_kernel.ops.kvcache.triton_virtual_blocks import virtual_slots_to_local
 
 from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
     V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,
+    V4_INDEXER_KV_GROUP_ID,
     V4_KERNEL_BLOCK_ROWS,
     V4_SWA_KV_GROUP_ID,
     DeepseekV4CacheLayout,
     parse_v4_compressor_state_group_id,
     v4_compressed_kv_group_id,
+    v4_compressed_rows_per_page,
     v4_compressor_state_group_id,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
 from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
+    CacheGroupAddressSpace,
+)
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
@@ -181,6 +195,11 @@ def _compressed_boundary_mask(
 class DeepseekV4CacheMetadata:
     page_size: int
     page_table: torch.Tensor
+    dcp_size: int = 1
+    dcp_rank: int = 0
+    group_address_spaces: Mapping[str, CacheGroupAddressSpace] = field(
+        default_factory=dict
+    )
     block_tables: dict[str, torch.Tensor] = field(default_factory=dict)
     # Per-sliding-group [num_reqs] int32 base logical-page offset that
     # accompanies each compact per-group table. Consumers index sliding tables as
@@ -194,7 +213,7 @@ class DeepseekV4CacheMetadata:
     )
     indexer_state_block_table: torch.Tensor | None = None
     indexer_state_base_logical_page: torch.Tensor | None = None
-    decode_compressed_slot_mappings: dict[tuple[int, int], torch.Tensor] = field(
+    decode_compressed_slot_mappings: dict[tuple[int | str, int], torch.Tensor] = field(
         default_factory=dict
     )
 
@@ -202,17 +221,45 @@ class DeepseekV4CacheMetadata:
         self,
         compress_ratio: int,
         kv_cache_block_size: int | None = None,
+        *,
+        indexer: bool = False,
     ) -> torch.Tensor:
         del kv_cache_block_size
         if compress_ratio <= 1:
             return self.page_table
-        table = self.block_tables.get(v4_compressed_kv_group_id(compress_ratio))
+        group_id = self.compressed_group_id(compress_ratio, indexer=indexer)
+        table = self.block_tables.get(group_id)
         if table is None:
             raise RuntimeError(
                 "DeepSeek V4 missing cache-group block table for compressed "
-                f"KV group {v4_compressed_kv_group_id(compress_ratio)!r}"
+                f"KV group {group_id!r}"
             )
         return table
+
+    def compressed_group_id(self, compress_ratio: int, *, indexer: bool = False) -> str:
+        """Resolve indexer storage independently when DCP splits the group."""
+        if indexer and self.dcp_size > 1:
+            return V4_INDEXER_KV_GROUP_ID
+        return v4_compressed_kv_group_id(compress_ratio)
+
+    def local_compressed_write_slots(
+        self, slots: torch.Tensor, compress_ratio: int
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Return local compressed slots and the explicit payload/scale mask.
+
+        DCP1 preserves its existing writer API. DCP>1 requires the declared
+        address space and maps nonowners to safe slot 0 with a false mask.
+        """
+        if self.dcp_size == 1:
+            return slots, None
+        space = self.group_address_spaces[v4_compressed_kv_group_id(compress_ratio)]
+        return virtual_slots_to_local(
+            slots,
+            rows_per_page=v4_compressed_rows_per_page(compress_ratio),
+            virtual_block_count=space.virtual_block_count,
+            degree=space.allocation_bucket_count,
+            rank=self.dcp_rank,
+        )
 
     @staticmethod
     def safe_page_ids(
@@ -231,9 +278,13 @@ class DeepseekV4CacheMetadata:
         compress_ratio: int,
         kv_cache_block_size: int,
         is_valid_token: torch.Tensor | None = None,
+        indexer: bool = False,
     ) -> torch.Tensor:
         num_tokens = token_to_req_indices.shape[0]
-        key = (compress_ratio, kv_cache_block_size)
+        key = (
+            V4_INDEXER_KV_GROUP_ID if indexer and self.dcp_size > 1 else compress_ratio,
+            kv_cache_block_size,
+        )
         out = self.decode_compressed_slot_mappings.get(key)
         if out is None or out.shape[0] < num_tokens or out.device != seq_lens.device:
             if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
@@ -245,7 +296,9 @@ class DeepseekV4CacheMetadata:
                 out = torch.empty(num_tokens, dtype=torch.int64, device=seq_lens.device)
             self.decode_compressed_slot_mappings[key] = out
 
-        page_table = self.compressed_page_table(compress_ratio, kv_cache_block_size)
+        page_table = self.compressed_page_table(
+            compress_ratio, kv_cache_block_size, indexer=indexer
+        )
         if page_table is not self.page_table:
             req_idx = token_to_req_indices[:num_tokens].to(torch.int64)
             query_starts = query_start_loc[req_idx].to(torch.int64)
@@ -269,7 +322,7 @@ class DeepseekV4CacheMetadata:
             )
             offsets = compressed_pos % kv_cache_block_size
             base_offsets = self.block_table_base_offsets.get(
-                v4_compressed_kv_group_id(compress_ratio)
+                self.compressed_group_id(compress_ratio, indexer=indexer)
             )
             if base_offsets is not None:
                 page_indices = (
@@ -280,7 +333,9 @@ class DeepseekV4CacheMetadata:
                     )[req_idx]
                 )
             page_ids = _safe_page_ids(page_table, req_idx, page_indices)
-            valid_slots = (page_ids >= 0) & _compressed_boundary_mask(
+            valid_slots = (
+                page_ids >= (1 if self.dcp_size > 1 else 0)
+            ) & _compressed_boundary_mask(
                 positions,
                 compress_ratio,
             )
@@ -313,14 +368,15 @@ class DeepseekV4CacheMetadata:
         seq_lens: torch.Tensor,
         is_valid_token: torch.Tensor | None = None,
     ) -> None:
-        for compress_ratio, kv_cache_block_size in list(
+        for group_key, kv_cache_block_size in list(
             self.decode_compressed_slot_mappings
         ):
             self._update_decode_compressed_slot_mapping(
                 token_to_req_indices=token_to_req_indices,
                 query_start_loc=query_start_loc,
                 seq_lens=seq_lens,
-                compress_ratio=compress_ratio,
+                compress_ratio=4 if group_key == V4_INDEXER_KV_GROUP_ID else group_key,
+                indexer=group_key == V4_INDEXER_KV_GROUP_ID,
                 kv_cache_block_size=kv_cache_block_size,
                 is_valid_token=is_valid_token,
             )
@@ -336,17 +392,27 @@ class DeepseekV4CacheMetadata:
         kv_cache_block_size: int | None = None,
         use_decode_cache: bool = False,
         is_valid_token: torch.Tensor | None = None,
+        indexer: bool = False,
     ) -> torch.Tensor:
         if kv_cache_block_size is None:
             kv_cache_block_size = self.page_size
-        page_table = self.compressed_page_table(compress_ratio, kv_cache_block_size)
+        page_table = self.compressed_page_table(
+            compress_ratio, kv_cache_block_size, indexer=indexer
+        )
         if (
             use_decode_cache
             and positions.is_cuda
             and (page_table.is_cuda or self.page_table.is_cuda)
         ):
             cached = self.decode_compressed_slot_mappings.get(
-                (compress_ratio, kv_cache_block_size)
+                (
+                    (
+                        V4_INDEXER_KV_GROUP_ID
+                        if indexer and self.dcp_size > 1
+                        else compress_ratio
+                    ),
+                    kv_cache_block_size,
+                )
             )
             if (
                 cached is not None
@@ -361,6 +427,7 @@ class DeepseekV4CacheMetadata:
                 compress_ratio=compress_ratio,
                 kv_cache_block_size=kv_cache_block_size,
                 is_valid_token=is_valid_token,
+                indexer=indexer,
             )
             return mapping[: positions.numel()]
         compressed_pos = torch.div(
@@ -375,7 +442,7 @@ class DeepseekV4CacheMetadata:
             page_ids = page_table[req_idx, page_indices.long()].to(torch.int64)
         else:
             base_offsets = self.block_table_base_offsets.get(
-                v4_compressed_kv_group_id(compress_ratio)
+                self.compressed_group_id(compress_ratio, indexer=indexer)
             )
             if base_offsets is not None:
                 page_indices = (
@@ -387,7 +454,9 @@ class DeepseekV4CacheMetadata:
                 )
             page_ids = _safe_page_ids(page_table, req_idx, page_indices.long())
         slots = page_ids.to(torch.int64) * kv_cache_block_size + offsets
-        valid_slots = (page_ids >= 0) & _compressed_boundary_mask(
+        valid_slots = (
+            page_ids >= (1 if self.dcp_size > 1 else 0)
+        ) & _compressed_boundary_mask(
             positions,
             compress_ratio,
         )

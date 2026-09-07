@@ -37,7 +37,7 @@ get_mla_metadata = error_fn
 
 if platform.is_nvidia and platform.is_hopper_plus:
     try:
-        from flash_mla import (
+        from tokenspeed_kernel.thirdparty.flash_mla import (
             flash_mla_sparse_fwd,
             flash_mla_with_kvcache,
             get_mla_metadata,
@@ -363,7 +363,8 @@ if (
             "head_dim": frozenset({512}),
             "cache_layout": frozenset({"fp8_swa_page_planar"}),
             "topk_layout": frozenset({"global_slots"}),
-            "support_sink": frozenset({True}),
+            "support_sink": frozenset({True, False}),
+            "return_lse": frozenset({False, True}),
             "has_extra_segment": frozenset({False, True}),
             "metadata_dtypes": frozenset({torch.int32}),
         },
@@ -376,14 +377,17 @@ if (
         swa_slots: torch.Tensor,
         swa_lens: torch.Tensor,
         swa_page_size: int,
-        attn_sink: torch.Tensor,
+        attn_sink: torch.Tensor | None,
         softmax_scale: float,
         extra_kv_cache: torch.Tensor | None = None,
         extra_slots: torch.Tensor | None = None,
         extra_lens: torch.Tensor | None = None,
         extra_page_size: int | None = None,
         out: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if return_lse and attn_sink is not None:
+            raise ValueError("FlashMLA DCP partials must omit the sink")
         q_kernel = q.unsqueeze(1)
         swa_indices = swa_slots.reshape(q.shape[0], 1, -1)
         row_bytes = _dsv4_fp8_row_bytes(q.shape[-1])
@@ -398,7 +402,7 @@ if (
                 row_bytes,
             )
             extra_indices = extra_slots.reshape(q.shape[0], 1, -1)
-        result, _ = flash_mla_with_kvcache(
+        result, lse = flash_mla_with_kvcache(
             q=q_kernel,
             k_cache=_fp8_page_planar_cache_view(
                 swa_kv_cache,
@@ -408,12 +412,19 @@ if (
             block_table=None,
             cache_seqlens=None,
             head_dim_v=q.shape[-1],
-            tile_scheduler_metadata=_get_dsv4_tile_meta(
-                q_kernel,
-                swa_indices.shape[-1],
-                swa_page_size,
-                extra_page_size,
-                0 if extra_slots is None else extra_slots.shape[-1],
+            # Ownership filtering changes selected lengths across layers.
+            # A fresh object records scheduler generation in CUDA graphs too,
+            # so replay uses the new device lengths rather than capture values.
+            tile_scheduler_metadata=(
+                get_mla_metadata()[0]
+                if return_lse
+                else _get_dsv4_tile_meta(
+                    q_kernel,
+                    swa_indices.shape[-1],
+                    swa_page_size,
+                    extra_page_size,
+                    0 if extra_slots is None else extra_slots.shape[-1],
+                )
             ),
             softmax_scale=float(softmax_scale),
             is_fp8_kvcache=True,
@@ -426,10 +437,22 @@ if (
         )
         if result.dim() == 4:
             result = result.squeeze(1)
+        if return_lse:
+            # FlashMLA reports natural-log LSE excluding the sink. Its usual
+            # sink-scaled output would not be a compatible partial, hence the
+            # explicit no-sink gate above. Empty shards have a defined state.
+            lse = lse.squeeze(-1).float()
+            if lse.shape != result.shape[:-1]:
+                raise ValueError("FlashMLA DCP LSE shape disagrees with output")
+            nonempty = swa_lens.reshape(-1) > 0
+            if extra_lens is not None:
+                nonempty = nonempty | (extra_lens.reshape(-1) > 0)
+            result = torch.where(nonempty[:, None, None], result, 0)
+            lse = torch.where(nonempty[:, None], lse, -torch.inf)
         if out is not None:
             out.copy_(result)
-            return out
-        return result
+            result = out
+        return (result, lse.contiguous()) if return_lse else result
 
 
 if (

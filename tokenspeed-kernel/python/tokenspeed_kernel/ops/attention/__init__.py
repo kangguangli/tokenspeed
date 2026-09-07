@@ -3733,7 +3733,7 @@ def dsv4_decode(
     swa_slots: torch.Tensor,
     swa_lens: torch.Tensor,
     swa_page_size: int,
-    attn_sink: torch.Tensor,
+    attn_sink: torch.Tensor | None,
     softmax_scale: float,
     extra_kv_cache: torch.Tensor | None = None,
     extra_slots: torch.Tensor | None = None,
@@ -3742,7 +3742,8 @@ def dsv4_decode(
     out: torch.Tensor | None = None,
     override: str | None = None,
     solution: str | None = None,
-) -> torch.Tensor:
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run DeepSeek V4 selected attention over page-planar FP8 caches.
 
     SWA and optional extra compressed rows form independent selected segments.
@@ -3758,7 +3759,8 @@ def dsv4_decode(
             prefix must be smaller than ``pages * swa_page_size``.
         swa_lens: Valid SWA selection length for each query token.
         swa_page_size: Number of SWA rows in each cache page.
-        attn_sink: One attention sink logit per query head.
+        attn_sink: One attention sink logit per query head, or None to omit
+            the sink when computing a DCP partial.
         softmax_scale: Scale applied to query-key dot products.
         extra_kv_cache: Optional uint8 page-planar compressed cache.
         extra_slots: Selected global slots in ``extra_kv_cache``. Nonnegative
@@ -3769,9 +3771,13 @@ def dsv4_decode(
         out: Optional output shaped like ``q``.
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
+        return_lse: Return a no-sink partial and its natural-log LSE. Requires
+            attn_sink=None and an explicitly compatible kernel.
 
     Returns:
-        BF16 attention output shaped like ``q``.
+        BF16 attention output shaped like ``q``. With return_lse=True, also
+        return FP32 LSE shaped [tokens, heads]; empty selections have output
+        zero and LSE -inf. Sink scaling is never included in these partials.
     """
     if q.dim() != 3 or q.shape[0] < 1 or q.shape[-1] != 512:
         raise ValueError(
@@ -3790,10 +3796,12 @@ def dsv4_decode(
         raise TypeError("swa_slots must have dtype int32 or int64")
     if swa_lens.dtype not in (torch.int32, torch.int64):
         raise TypeError("swa_lens must have dtype int32 or int64")
-    if attn_sink.numel() < q.shape[1]:
+    if return_lse and attn_sink is not None:
+        raise ValueError("DCP partial attention requires attn_sink=None")
+    if attn_sink is not None and attn_sink.numel() < q.shape[1]:
         raise ValueError("attn_sink must provide one value per query head")
     if any(
-        tensor.device != q.device
+        tensor is not None and tensor.device != q.device
         for tensor in (swa_kv_cache, swa_slots, swa_lens, attn_sink)
     ):
         raise ValueError("all paged selected-attention tensors must share a device")
@@ -3842,7 +3850,8 @@ def dsv4_decode(
         "num_heads": int(q.shape[1]),
         "cache_layout": "fp8_swa_page_planar",
         "topk_layout": "global_slots",
-        "support_sink": True,
+        "support_sink": attn_sink is not None,
+        "return_lse": return_lse,
         "has_extra": has_extra_segment,
         "has_extra_segment": has_extra_segment,
         "swa_selected_width": swa_width,
@@ -3869,6 +3878,12 @@ def dsv4_decode(
         solution=solution,
         override=override,
     )
+    if return_lse:
+        spec = KernelRegistry.get().get_by_name(kernel.name)
+        if spec is None or True not in spec.traits.get("return_lse", ()):
+            raise RuntimeError(
+                f"kernel {kernel.name!r} does not declare no-sink DSV4 LSE support"
+            )
     shape_params = {
         "tokens": tokens,
         "num_heads": int(q.shape[1]),
@@ -3879,6 +3894,8 @@ def dsv4_decode(
         "extra_page_size": int(extra_page_size or 0),
         "has_extra_segment": has_extra_segment,
     }
+    if return_lse:
+        shape_params["return_lse"] = True
     ShapeCapture.get().record(
         "attention",
         "dsv4_decode",
@@ -3906,6 +3923,7 @@ def dsv4_decode(
             extra_lens=extra_lens,
             extra_page_size=extra_page_size,
             out=out,
+            **({"return_lse": True} if return_lse else {}),
         )
 
 

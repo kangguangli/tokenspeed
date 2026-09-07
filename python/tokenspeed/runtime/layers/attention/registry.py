@@ -315,6 +315,19 @@ def _create_attn_config(
     if arch not in _CONFIG_CLS:
         raise NotImplementedError(f"Not supported Attention Arch: {arch!r}")
     config = _CONFIG_CLS[arch].generate(server_args, model_config, is_draft)
+    if server_args.mapping.attn.has_dcp:
+        softmax_spec = config.component(SoftmaxAttnConfig)
+        if softmax_spec.backend_name != "deepseek_v4":
+            raise ValueError("DCP currently requires the DeepSeek V4 attention backend")
+        attn_mapping = server_args.mapping.attn
+        config = dataclasses.replace(
+            config,
+            dcp_size=attn_mapping.dcp_size,
+            dcp_rank=attn_mapping.dcp_rank,
+            dcp_group=attn_mapping.dcp_group,
+            dcp_comm_backend=server_args.dcp_comm_backend,
+            dcp_reference_backend=server_args.dcp_dsv4_reference_backend,
+        )
     # Extra components are built through the same generate() protocol and
     # composed into config.components (consumers look them up by class via
     # ``component()``).
@@ -1026,6 +1039,7 @@ def create_attn_components(
         spec,
         device=config.device,
         enable_memory_saver=enable_memory_saver,
+        dcp_rank=config.dcp_rank,
     )
     if pp_logical_plan is not None:
         arena.pp_logical_plan = pp_logical_plan

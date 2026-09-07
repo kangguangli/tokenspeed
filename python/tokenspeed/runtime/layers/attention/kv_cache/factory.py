@@ -18,12 +18,16 @@ def create_cache_arena(
     *,
     device: str,
     enable_memory_saver: bool,
+    dcp_rank: int = 0,
 ) -> CacheArena:
     """Allocate the one arena every compute view of this spec shares."""
     return CacheArena(
         spec.memory_plan,
         device,
         cache_group_specs=spec.cache_group_specs,
+        cache_group_placements=spec.cache_group_placements,
+        dcp_size=spec.dcp_size,
+        dcp_rank=dcp_rank,
         token_capacity=spec.token_capacity,
         enable_memory_saver=enable_memory_saver,
     )

@@ -80,6 +80,7 @@ struct CacheGroupSpec {
     // Tokens represented by one CacheBlock in this group. Required: must be
     // a positive divisor of the coordinator-wide prefix granularity.
     std::int32_t block_granularity{0};
+    std::int32_t allocation_bucket_count{1};
 };
 
 // Per-group input for one admission. prefix_hashes is the request's cumulative

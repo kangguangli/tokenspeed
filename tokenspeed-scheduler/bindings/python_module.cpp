@@ -112,7 +112,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                std::int32_t entry_stride_tokens, std::int32_t total_pages,
                tokenspeed::CacheGroupConfig::Retention retention, std::optional<std::int32_t> sliding_window_tokens,
                tokenspeed::CacheGroupFamily family, std::int32_t cache_blocks_per_lcm_block,
-               tokenspeed::CacheTransferPolicy transfer_policy) {
+               tokenspeed::CacheTransferPolicy transfer_policy, std::int32_t allocation_bucket_count) {
                 new (self) tokenspeed::CacheGroupConfig{std::move(group_id),
                                                         rows_per_page,
                                                         entry_stride_tokens,
@@ -121,18 +121,21 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                                                         retention,
                                                         sliding_window_tokens,
                                                         family,
-                                                        transfer_policy};
+                                                        transfer_policy,
+                                                        allocation_bucket_count};
             },
             nb::arg("group_id"), nb::arg("rows_per_page"), nb::arg("entry_stride_tokens"), nb::arg("total_pages"),
             nb::arg("retention") = tokenspeed::CacheGroupConfig::Retention::FullHistory,
             nb::arg("sliding_window_tokens") = std::nullopt, nb::arg("family") = tokenspeed::CacheGroupFamily::History,
             nb::arg("cache_blocks_per_lcm_block") = 1,
-            nb::arg("transfer_policy") = tokenspeed::CacheTransferPolicy::Unspecified)
+            nb::arg("transfer_policy") = tokenspeed::CacheTransferPolicy::Unspecified,
+            nb::arg("allocation_bucket_count") = 1)
         .def_rw("group_id", &tokenspeed::CacheGroupConfig::group_id)
         .def_rw("rows_per_page", &tokenspeed::CacheGroupConfig::rows_per_page)
         .def_rw("entry_stride_tokens", &tokenspeed::CacheGroupConfig::entry_stride_tokens)
         .def_rw("total_pages", &tokenspeed::CacheGroupConfig::total_pages)
         .def_rw("cache_blocks_per_lcm_block", &tokenspeed::CacheGroupConfig::cache_blocks_per_lcm_block)
+        .def_rw("allocation_bucket_count", &tokenspeed::CacheGroupConfig::allocation_bucket_count)
         .def_rw("retention", &tokenspeed::CacheGroupConfig::retention)
         .def_rw("sliding_window_tokens", &tokenspeed::CacheGroupConfig::sliding_window_tokens)
         .def_rw("family", &tokenspeed::CacheGroupConfig::family)

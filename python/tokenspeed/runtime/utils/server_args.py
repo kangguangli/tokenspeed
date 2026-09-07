@@ -252,6 +252,9 @@ class ServerArgs:
     use_trtllm_ragged_deepseek_prefill: bool | None = None
 
     # DeepSeek V4
+    decode_context_parallel_size: int = 1
+    dcp_comm_backend: Literal["ag_rs", "a2a"] = "ag_rs"
+    dcp_dsv4_reference_backend: Literal["selected_kv"] | None = None
     deepseek_v4_mega_moe_max_num_tokens: int = 0
     deepseek_v4_indexer_prefill_max_logits_mb: int = 512
     deepseek_v4_prefill_chunk_size: int = 4
@@ -657,6 +660,7 @@ class ServerArgs:
             attn_tp_size=attn_tp_size,
             attn_cp_size=attn_cp_size,
             attn_dp_size=attn_dp_size,
+            attn_dcp_size=self.decode_context_parallel_size,
             dense_tp_size=dense_tp_size,
             dense_dp_size=dense_dp_size,
             moe_tp_size=moe_tp_size,
@@ -673,6 +677,11 @@ class ServerArgs:
         )
 
         # Impl constraints:
+        if self.decode_context_parallel_size > 1:
+            if self.disaggregation_mode != "null" or self.enable_kvstore:
+                raise ValueError(
+                    "DCP cache transfer does not yet support PD or KVStore"
+                )
         if self.mapping.moe.has_tp and self.mapping.moe.has_ep:
             raise ValueError("MoE TP and EP cannot be both > 1")
 
@@ -2021,6 +2030,24 @@ class ServerArgs:
             type=int,
             default=ServerArgs.attn_tp_size,
             help="Specify tp size for attn part",
+        )
+        parser.add_argument(
+            "--decode-context-parallel-size",
+            type=int,
+            default=ServerArgs.decode_context_parallel_size,
+            help="Shard DeepSeek V4 compressed KV over a subgroup of attention TP.",
+        )
+        parser.add_argument(
+            "--dcp-comm-backend",
+            choices=("ag_rs", "a2a"),
+            default=ServerArgs.dcp_comm_backend,
+            help="Communication used to combine DCP attention partials.",
+        )
+        parser.add_argument(
+            "--dcp-dsv4-reference-backend",
+            choices=("selected_kv",),
+            default=None,
+            help="Reconstruct selected KV for the DSV4 DCP correctness reference.",
         )
         parser.add_argument(
             "--dense-tp-size",

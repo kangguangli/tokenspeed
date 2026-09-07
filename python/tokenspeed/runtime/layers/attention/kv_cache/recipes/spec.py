@@ -549,7 +549,7 @@ def group(
     fields_for_layer,
     page_sizes: Mapping[str, int] | None = None,
     pd_disaggregation_enabled: bool = False,
-) -> tuple[tuple[CacheGroupSpec, tuple], ...]:
+) -> tuple[plan.CacheGroupDeclaration, ...]:
     """Walk the layers once, building each group whole.
 
     A cache group has two halves -- the scheduler-facing spec and the bytes
@@ -674,7 +674,9 @@ def group(
     published = specs.values()
     if pd_disaggregation_enabled:
         published = apply_pd_transfer_policies(tuple(published))
-    return tuple((spec, fields[spec.group_id]) for spec in published)
+    return tuple(
+        plan.CacheGroupDeclaration(spec, fields[spec.group_id]) for spec in published
+    )
 
 
 def _layer_group_spec(

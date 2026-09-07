@@ -50,6 +50,8 @@ struct CacheGroupConfig {
     std::optional<std::int32_t> sliding_window_tokens{};
     CacheGroupFamily family{CacheGroupFamily::History};
     CacheTransferPolicy transfer_policy{CacheTransferPolicy::Unspecified};
+    // Integer placement buckets, independent of tokens and process topology.
+    std::int32_t allocation_bucket_count{1};
 
     std::int32_t BlockGranularity() const { return rows_per_page * entry_stride_tokens; }
 

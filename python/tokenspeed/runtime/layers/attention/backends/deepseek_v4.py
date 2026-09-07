@@ -7,9 +7,16 @@
 # copies of the Software, and to permit persons to whom the Software is
 # furnished to do so, subject to the following conditions:
 #
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
 # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 # IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 
 from __future__ import annotations
 
@@ -29,14 +36,22 @@ from tokenspeed_kernel.ops.attention.triton.dsv4 import (
     dsv4_compute_global_topk_indices_and_lens,
     dsv4_decode_swa_indices_and_lens,
     dsv4_dequantize_and_gather_k_cache,
+    dsv4_dequantize_selected_rows,
     dsv4_indexer_decode_metadata_compute,
 )
+from tokenspeed_kernel.ops.attention.triton.dsv4_dcp import dsv4_dcp_selected_slots
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
+from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+from tokenspeed.runtime.layers.attention.dcp.comm import (
+    combine_attention_partials,
+    gather_query_heads,
+)
+from tokenspeed.runtime.layers.attention.dcp.reference import selected_kv_attention
 from tokenspeed.runtime.layers.attention.deepseek_v4.metadata import (
     DeepseekV4ForwardMetadata,
 )
@@ -45,6 +60,7 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
     V4_KERNEL_BLOCK_ROWS,
     first_v4_compressed_kv_group_id,
     v4_compressed_kv_group_id,
+    v4_compressed_rows_per_page,
 )
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     DEEPSEEK_V4_PAGE_SIZE,
@@ -75,13 +91,17 @@ def _compressed_block_table_base_offsets(
 def _decode_positions_from_metadata(
     metadata: DeepseekV4ForwardMetadata,
     num_tokens: int,
+    token_start: int = 0,
 ) -> torch.Tensor:
-    token_to_req = metadata.token_to_req_indices[:num_tokens].to(torch.int64)
+    token_to_req = metadata.token_to_req_indices[
+        token_start : token_start + num_tokens
+    ].to(torch.int64)
     query_starts = metadata.query_start_loc[token_to_req].to(torch.int64)
     query_lens = metadata.query_lens[token_to_req].to(torch.int64)
     seq_lens = metadata.seq_lens[token_to_req].to(torch.int64)
     token_offsets = torch.arange(
-        num_tokens,
+        token_start,
+        token_start + num_tokens,
         dtype=torch.int64,
         device=metadata.seq_lens.device,
     )
@@ -120,9 +140,12 @@ def _refresh_decode_indexer_plan_cache(
         page_table = metadata.cache.compressed_page_table(
             compress_ratio,
             cache_block_size,
+            indexer=True,
         )
         block_table_base_offsets = (
-            _compressed_block_table_base_offsets(metadata, compress_ratio)
+            metadata.cache.block_table_base_offsets.get(
+                metadata.cache.compressed_group_id(compress_ratio, indexer=True)
+            )
             if page_table is not metadata.cache.page_table
             else None
         )
@@ -277,6 +300,12 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self._expected_cache_group_ids: tuple[str, ...] | None = None
         self._cache_group_raw_tokens_per_page: dict[str, int] = {}
         self._cache_group_max_page_ids: dict[str, int] = {}
+        self._cache_runtime_contract = None
+        self.dcp_size = getattr(config, "dcp_size", 1)
+        self.dcp_rank = getattr(config, "dcp_rank", 0)
+        self.dcp_group = getattr(config, "dcp_group", ())
+        self.dcp_comm_backend = getattr(config, "dcp_comm_backend", "ag_rs")
+        self.dcp_reference_backend = getattr(config, "dcp_reference_backend", None)
         # Per-sliding-group [max_bs] int32 buffers mirroring the block-table
         # buffers; populated by init_cuda_graph_state.
         self._cuda_graph_block_table_base_offsets: dict[str, torch.Tensor] = {}
@@ -326,6 +355,10 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         if len(group_ids) != len(set(group_ids)):
             raise RuntimeError("DeepSeek V4 cache group specs contain duplicate IDs")
         page_counts = dict(cache_group_page_counts or {})
+        if self._cache_runtime_contract is not None:
+            # Incoming tables contain virtual IDs; physical page counts are
+            # reserved for arena binding and kernel slots.
+            page_counts = dict(self._cache_runtime_contract.virtual_block_counts)
         if not group_ids:
             if page_counts:
                 raise RuntimeError(
@@ -381,10 +414,28 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         return specs, page_counts
 
     def configure_runtime(self, **kwargs) -> None:
+        contract = kwargs.pop("cache_runtime_contract", None)
+        if contract is not None:
+            if contract.dcp_size != self.dcp_size:
+                raise ValueError(
+                    "DeepSeek V4 attention and cache DCP topologies disagree"
+                )
+            self._cache_runtime_contract = contract
         self._configure_cache_group_contract(
             kwargs.pop("cache_group_specs", ()),
             kwargs.pop("cache_group_page_counts", None),
         )
+
+    def _cache_placement_kwargs(self) -> dict:
+        return {
+            "dcp_size": self.dcp_size,
+            "dcp_rank": self.dcp_rank,
+            "group_address_spaces": (
+                self._cache_runtime_contract.group_address_spaces
+                if self._cache_runtime_contract is not None
+                else {}
+            ),
+        }
 
     def _prepare_cache_group_tables(
         self,
@@ -784,6 +835,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             if is_cuda_graph_metadata:
                 self._cuda_graph_draft_decode_metadata[bs] = metadata
             self._draft_decode_metadata = metadata
+            self._refresh_dcp_dense_compressed_metadata(metadata)
             return
 
         metadata.req_pool_indices = prefill_metadata.req_pool_indices
@@ -816,6 +868,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             max_context_len=self.context_len,
         )
         _refresh_decode_indexer_schedule_metadata(metadata)
+        self._refresh_dcp_dense_compressed_metadata(metadata)
         self._draft_decode_metadata = metadata
 
     def _select_decode_metadata(
@@ -1089,6 +1142,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             (1, 0),
         )
         cache_metadata = DeepseekV4CacheMetadata(
+            **self._cache_placement_kwargs(),
             page_size=self.kernel_page_size,
             page_table=page_table,
             block_tables=block_tables,
@@ -1113,6 +1167,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             num_prefill_tokens=num_prefill_tokens,
             forward_mode=metadata_forward_mode,
         )
+        self._refresh_dcp_dense_compressed_metadata(self.forward_metadata)
         if is_packed_decode:
             self.forward_decode_metadata = self.forward_metadata
             if getattr(self, "is_draft", False):
@@ -1209,6 +1264,29 @@ class DeepseekV4AttentionBackend(AttentionBackend):
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if compress_ratio <= 1:
             return None, None
+        if self.dcp_size > 1:
+            if compress_ratio == 128:
+                metadata = self.forward_metadata
+                if metadata is None:
+                    raise RuntimeError("DeepSeek V4 DCP requires forward metadata")
+                key = (
+                    v4_compressed_kv_group_id(compress_ratio),
+                    block_size,
+                    positions.numel(),
+                )
+                cached = metadata.attention.dcp_dense_compressed.get(key)
+                if cached is None or cached[0].shape[0] != positions.numel():
+                    raise RuntimeError("C128 DCP decode metadata was not prepared")
+                indices, lens = cached
+                return indices.unsqueeze(1), lens
+            indices, lens, _ = self._dcp_selected_compressed_rows(
+                positions,
+                compress_ratio=compress_ratio,
+                block_size=block_size,
+                topk_indices=topk_indices,
+                compact=True,
+            )
+            return indices.unsqueeze(1), lens
         metadata = self.forward_metadata
         if metadata is None:
             raise RuntimeError("DeepSeek V4 decode requires forward metadata")
@@ -1357,6 +1435,116 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             compressed_table_capacity=compressed_table_capacity,
         )
 
+    def _refresh_dcp_dense_compressed_metadata(
+        self, metadata: DeepseekV4ForwardMetadata
+    ) -> None:
+        """Prepare C128 local slots once for this forward's decode queries.
+
+        Eager calls own fresh outputs. Graph metadata retains only the output
+        tensors that captured attention reads; replay and draft advancement
+        update those tensors in place. Intermediate allocations use PyTorch's
+        allocator, including its graph pool during captured draft steps.
+        """
+        group_id = v4_compressed_kv_group_id(128)
+        if (
+            self.dcp_size <= 1
+            or self.dcp_reference_backend == "selected_kv"
+            or metadata.forward_mode is None
+            or not (
+                metadata.forward_mode.is_decode_or_idle()
+                or metadata.forward_mode.is_mixed()
+            )
+            or metadata.decode_token_count() == 0
+            or group_id not in metadata.cache.block_tables
+        ):
+            return
+        start = metadata.num_prefill_tokens
+        count = metadata.decode_token_count()
+        positions = _decode_positions_from_metadata(metadata, count, start)
+        width = self._dense_compressed_indices_width(128)
+        rows = (
+            self._cache_group_raw_tokens_per_page.get(
+                group_id, v4_compressed_rows_per_page(128) * 128
+            )
+            // 128
+        )
+        space = metadata.cache.group_address_spaces[group_id]
+        key = (group_id, rows, count)
+        cached = metadata.attention.dcp_dense_compressed.get(key)
+        with torch.inference_mode(False):
+            candidates = (
+                torch.arange(width, device=positions.device, dtype=torch.int32)
+                .unsqueeze(0)
+                .expand(count, -1)
+            )
+            slots, lens, _ = dsv4_dcp_selected_slots(
+                candidates,
+                positions=positions,
+                token_to_req_indices=metadata.token_to_req_indices[start:],
+                block_table=metadata.cache.compressed_page_table(128),
+                rows_per_page=rows,
+                compress_ratio=128,
+                virtual_block_count=space.virtual_block_count,
+                degree=space.allocation_bucket_count,
+                rank=self.dcp_rank,
+                block_table_base_offsets=_compressed_block_table_base_offsets(
+                    metadata, 128
+                ),
+                is_valid_token=(
+                    metadata.is_valid_token[start:]
+                    if metadata.is_valid_token is not None
+                    else None
+                ),
+                out_slots=cached[0] if cached is not None else None,
+                out_lens=cached[1] if cached is not None else None,
+                return_global_valid=False,
+            )
+        metadata.attention.dcp_dense_compressed[key] = (slots, lens)
+
+    def _dcp_selected_compressed_rows(
+        self,
+        positions: torch.Tensor,
+        *,
+        compress_ratio: int,
+        block_size: int,
+        topk_indices: torch.Tensor | None,
+        compact: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        metadata = self.forward_metadata
+        if metadata is None:
+            raise RuntimeError("DeepSeek V4 DCP requires forward metadata")
+        if compress_ratio == 4:
+            if topk_indices is None:
+                raise RuntimeError("DeepSeek V4 CSA decode requires top-k indices")
+            candidates = topk_indices
+        else:
+            width = self._dense_compressed_indices_width(compress_ratio)
+            candidates = torch.arange(width, device=positions.device, dtype=torch.int32)
+            candidates = candidates.unsqueeze(0).expand(positions.numel(), -1)
+        group_id = v4_compressed_kv_group_id(compress_ratio)
+        space = metadata.cache.group_address_spaces[group_id]
+        return dsv4_dcp_selected_slots(
+            candidates,
+            positions=positions,
+            token_to_req_indices=metadata.token_to_req_indices[: positions.numel()],
+            block_table=metadata.cache.compressed_page_table(compress_ratio),
+            rows_per_page=block_size,
+            compress_ratio=compress_ratio,
+            virtual_block_count=space.virtual_block_count,
+            degree=space.allocation_bucket_count,
+            rank=self.dcp_rank,
+            block_table_base_offsets=_compressed_block_table_base_offsets(
+                metadata, compress_ratio
+            ),
+            is_valid_token=(
+                metadata.is_valid_token[: positions.numel()]
+                if metadata.is_valid_token is not None
+                else None
+            ),
+            compact=compact,
+            return_global_valid=not compact,
+        )
+
     def forward_deepseek_v4_decode(
         self,
         *,
@@ -1387,6 +1575,19 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 "DeepSeek V4 decode metadata token count mismatch: "
                 f"metadata_tokens={metadata.token_to_req_indices.numel()}, "
                 f"q_tokens={q.shape[0]}"
+            )
+        if self.dcp_size > 1 and compress_ratio > 1:
+            return self._forward_dcp_decode(
+                q=q[:, :num_local_heads],
+                positions=positions,
+                token_to_kv_pool=token_to_kv_pool,
+                layer_id=layer_id,
+                compress_ratio=compress_ratio,
+                padded_heads=padded_heads,
+                window_size=window_size,
+                softmax_scale=softmax_scale,
+                attn_sink=attn_sink,
+                topk_indices=topk_indices,
             )
         if q.shape[1] == padded_heads:
             q_padded = q.contiguous()
@@ -1442,6 +1643,101 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             ),
         )
         return out[:, :num_local_heads]
+
+    def _forward_dcp_decode(
+        self,
+        *,
+        q: torch.Tensor,
+        positions: torch.Tensor,
+        token_to_kv_pool,
+        layer_id: int,
+        compress_ratio: int,
+        padded_heads: int,
+        window_size: int,
+        softmax_scale: float,
+        attn_sink: torch.Tensor,
+        topk_indices: torch.Tensor | None,
+    ) -> torch.Tensor:
+        metadata = self.forward_metadata
+        assert metadata is not None
+        swa_slots, swa_lens = self._update_decode_swa_metadata(
+            metadata,
+            window_size=window_size,
+            block_size=token_to_kv_pool.swa_block_size,
+        )
+        if self.dcp_reference_backend == "selected_kv":
+            rows = token_to_kv_pool.get_compressed_block_size(layer_id)
+            extra_slots, _, extra_valid = self._dcp_selected_compressed_rows(
+                positions,
+                compress_ratio=compress_ratio,
+                block_size=rows,
+                topk_indices=topk_indices,
+                compact=False,
+            )
+            extra = dsv4_dequantize_selected_rows(
+                token_to_kv_pool.get_compressed_kv_buffer_2d(layer_id),
+                extra_slots,
+                rows,
+            )
+            # Every selected row has one owner. SUM reconstructs only these
+            # transient rows; no replicated persistent cache is introduced.
+            extra = all_reduce(extra, self.dcp_group)
+            swa_valid = (
+                torch.arange(swa_slots.shape[-1], device=q.device)[None, :]
+                < swa_lens.reshape(-1, 1)
+            ) & (swa_slots >= 0)
+            swa = dsv4_dequantize_selected_rows(
+                token_to_kv_pool.get_swa_kv_buffer(layer_id),
+                torch.where(swa_valid, swa_slots, -1),
+                token_to_kv_pool.swa_block_size,
+            )
+            return selected_kv_attention(
+                q,
+                torch.cat((swa, extra), dim=1),
+                torch.cat((swa_valid, extra_valid), dim=1),
+                attn_sink[: q.shape[1]],
+                softmax_scale,
+            )
+        # SWA is replicated. Count it on exactly one context shard.
+        local_swa_lens = swa_lens if self.dcp_rank == 0 else torch.zeros_like(swa_lens)
+        rows = token_to_kv_pool.get_compressed_block_size(layer_id)
+        extra_slots, extra_lens = self._decode_compressed_attention_indices_and_lens(
+            positions,
+            compress_ratio=compress_ratio,
+            block_size=rows,
+            topk_indices=topk_indices,
+        )
+        gathered_q = gather_query_heads(q, self.dcp_group)
+        actual_heads = gathered_q.shape[1]
+        kernel_heads = max(padded_heads, actual_heads)
+        if actual_heads < kernel_heads:
+            kernel_q = torch.nn.functional.pad(
+                gathered_q, (0, 0, 0, kernel_heads - actual_heads)
+            )
+        else:
+            kernel_q = gathered_q
+        partial, lse = dsv4_decode(
+            q=kernel_q,
+            swa_kv_cache=token_to_kv_pool.get_swa_kv_buffer(layer_id),
+            swa_slots=swa_slots,
+            swa_lens=local_swa_lens,
+            swa_page_size=token_to_kv_pool.swa_block_size,
+            attn_sink=None,
+            softmax_scale=softmax_scale,
+            extra_kv_cache=token_to_kv_pool.get_compressed_kv_buffer_2d(layer_id),
+            extra_slots=extra_slots,
+            extra_lens=extra_lens,
+            extra_page_size=rows,
+            return_lse=True,
+        )
+        return combine_attention_partials(
+            partial[:, :actual_heads],
+            lse[:, :actual_heads],
+            group=self.dcp_group,
+            rank=self.dcp_rank,
+            sink=attn_sink,
+            method=self.dcp_comm_backend,
+        )
 
     def forward_deepseek_v4_mixed(
         self,
@@ -1546,6 +1842,24 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             self.forward_metadata = saved_metadata
         return out
 
+    def _gather_compressed_prefill(self, **kwargs) -> None:
+        """Reconstruct transient compressed history from disjoint owner rows."""
+        out = kwargs["out"]
+        width = kwargs["max_gather_len"]
+        offset = kwargs["offset"]
+        segment = out[:, offset : offset + width]
+        if self.dcp_size > 1:
+            # Unequal request lengths leave padding unwritten by the gather.
+            # Zero it before collective reconstruction, including empty rows.
+            segment.zero_()
+        dsv4_dequantize_and_gather_k_cache(
+            **kwargs, dcp_degree=self.dcp_size, dcp_rank=self.dcp_rank
+        )
+        if self.dcp_size > 1 and width > 0:
+            compressed = segment.contiguous()
+            compressed = all_reduce(compressed, self.dcp_group)
+            segment.copy_(compressed)
+
     def _prefill_workspace(
         self,
         *,
@@ -1605,7 +1919,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             compressed_table_capacity = (
                 compressed_page_table.shape[1] * compressed_block_size
             )
-            dsv4_dequantize_and_gather_k_cache(
+            self._gather_compressed_prefill(
                 out=kv_workspace,
                 cache_2d=compressed_cache,
                 seq_lens=compressed_lens,
@@ -1667,7 +1981,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             compressed_table_capacity = (
                 compressed_page_table.shape[1] * compressed_block_size
             )
-            dsv4_dequantize_and_gather_k_cache(
+            self._gather_compressed_prefill(
                 out=kv_workspace,
                 cache_2d=compressed_cache,
                 seq_lens=compressed_lens,
@@ -1818,6 +2132,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             (1, 0),
         )
         sliced_cache = DeepseekV4CacheMetadata(
+            dcp_size=cache_metadata.dcp_size,
+            dcp_rank=cache_metadata.dcp_rank,
+            group_address_spaces=cache_metadata.group_address_spaces,
             page_size=cache_metadata.page_size,
             page_table=cache_metadata.page_table[req_start:req_end],
             block_tables=block_tables,
@@ -1845,7 +2162,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 else None
             ),
         )
-        return DeepseekV4ForwardMetadata(
+        sliced = DeepseekV4ForwardMetadata(
             req_pool_indices=metadata.req_pool_indices[req_start:req_end],
             seq_lens=metadata.seq_lens[req_start:req_end],
             query_lens=query_lens,
@@ -1871,6 +2188,19 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             num_prefill_tokens=num_prefill_tokens,
             forward_mode=forward_mode,
         )
+        if forward_mode.is_decode():
+            start = token_start - metadata.num_prefill_tokens
+            end = token_end - metadata.num_prefill_tokens
+            if start < 0:
+                raise RuntimeError("Decode metadata slice overlaps prefill queries")
+            sliced.attention.dcp_dense_compressed = {
+                (group_id, rows, token_count): (slots[start:end], lens[start:end])
+                for (group_id, rows, count), (slots, lens) in (
+                    metadata.attention.dcp_dense_compressed.items()
+                )
+                if count == metadata.decode_token_count()
+            }
+        return sliced
 
     def _forward_deepseek_v4_prefill_chunk(
         self,
@@ -2339,6 +2669,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             else {}
         )
         cache_metadata = DeepseekV4CacheMetadata(
+            **self._cache_placement_kwargs(),
             page_size=self.kernel_page_size,
             page_table=self._cuda_graph_page_table[:bs, : self.max_num_pages],
             block_tables=metadata_block_tables,
@@ -2377,6 +2708,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             metadata.query_lens_cpu = None
             metadata.forward_mode = metadata_forward_mode
         self._cuda_graph_metadata[bs] = metadata
+        self._refresh_dcp_dense_compressed_metadata(metadata)
         if is_packed_decode and getattr(self, "is_draft", False):
             self._prepare_draft_decode_metadata(
                 metadata,
@@ -2525,6 +2857,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         metadata.token_to_req_indices = self._cuda_graph_token_to_req[:total_tokens]
         metadata.is_valid_token = self._cuda_graph_is_valid_token[:total_tokens]
         metadata.cache = DeepseekV4CacheMetadata(
+            **self._cache_placement_kwargs(),
             page_size=self.kernel_page_size,
             page_table=self._cuda_graph_page_table[:bs, : self.max_num_pages],
             block_tables=metadata_block_tables,
@@ -2541,6 +2874,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         )
         metadata.num_prefill_reqs = 0
         metadata.num_prefill_tokens = 0
+        self._refresh_dcp_dense_compressed_metadata(metadata)
         if is_packed_decode and getattr(self, "is_draft", False):
             self._prepare_draft_decode_metadata(
                 metadata,
@@ -2605,6 +2939,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             max_context_len=self.context_len,
         )
         _refresh_decode_indexer_schedule_metadata(metadata)
+        self._refresh_dcp_dense_compressed_metadata(metadata)
         self.forward_decode_metadata = metadata
         self.forward_metadata = metadata
 

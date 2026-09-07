@@ -818,7 +818,8 @@ CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int
         const std::int32_t group_block_granularity = spec.block_granularity;
         _assert(group_block_granularity > 0 && prefix_granularity % group_block_granularity == 0,
                 "group block_granularity must be a positive divisor of the prefix granularity");
-        auto allocator = std::make_unique<GroupAllocator>(spec.cache_blocks_per_lcm_block, group_id);
+        auto allocator =
+            std::make_unique<GroupAllocator>(spec.cache_blocks_per_lcm_block, group_id, spec.allocation_bucket_count);
         std::unique_ptr<PrefixMatcher> matcher;
         switch (spec.kind) {
             case AttnKind::kFull:

@@ -144,6 +144,11 @@ entry *values*, however, are **`CacheBlock` ids** — handles to the physical
 storage the cache layer allocated. The scheduler owns allocation, so its output names that storage directly.
 Consumers outside the cache layer treat the ids as opaque.
 
+With DCP virtual-block placement, `CacheBatchMetadata` validates exported IDs
+against each group's **virtual** block count. The physical page count bounds
+local arena storage only; applying it to the scheduler table would reject valid
+remote-owner IDs before the runtime can translate them.
+
 Logical width does not imply dense physical residency. Full-history KV and
 retained sliding-window rows materialize every block their kernels read, but a
 full-history snapshot-state prefill normally needs only its input and final
@@ -449,6 +454,67 @@ repeatedly rebuilding, briefly decoding and re-retracting the same prompt is
 the escalating admission headroom each retraction adds to the victim's next
 admission. The protocol — victim choice, readmission order, why the release
 is safe before the L2 snapshot copies — is `scheduler.md` §2 and §4.
+
+## Virtual block placement within a shared physical plan
+
+`CacheGroupDeclaration` declares the logical spec, local fields and placement
+together. Its two-value iteration is a physical projection for `pack`; it does
+not include process topology. The memory plan continues to own local shapes,
+strides, packing and byte counts. `CacheRuntimeContract.group_address_spaces`
+joins those facts to the declaration and the shared DCP degree.
+
+For physical packing K, N usable parents and D placement buckets, a sharded
+group has `1 + N*K` local pages and `1 + N*D*K` virtual blocks. A replicated
+group uses one bucket. Existing `group_page_counts` and `group_packing` name
+physical quantities; the scheduler bridge explicitly consumes
+`virtual_block_counts` and `virtual_packing`. Virtual capacity must never be
+used to shape an arena field. Null ID 0 has no owner and forbids writes.
+
+The allocator receives only an integer `allocation_bucket_count`. It counts
+all nonnull refs in the request table, including shared prefixes and reserved
+headroom. Among available holes in already bound parents, it selects the
+least-loaded request bucket (ties by bucket ID), then the most occupied
+parent (ties by parent ID), then the lowest child ID. Allocation updates these
+occupancies before selecting the next child. Only when all bound-parent holes
+are exhausted may it open the next FIFO empty parent. Bucket balance cannot
+reserve an extra parent or cause admission failure while another bucket is
+available. A failed acquire leaves both placement and request tables unchanged.
+
+`BlockPool` maintains the free-slot count of each group and an ordered parent
+index per bucket. Each parent records only its lowest free slot per bucket;
+it does not materialize a list of every hole. Physical `occupy` and `Release`
+update these indices, including full-to-partial transitions and final-child
+release. Shared request/prefix references therefore keep both the parent
+binding and its index state alive until the last reference releases the block.
+These indices describe physical availability, not request-local owner loads.
+
+An exact acquire first checks `group holes + empty parents * group packing`.
+Capacity-first selection can consume all of these slots, so it then allocates
+directly without a second, pool-sized shadow planner. Insufficient capacity
+returns before changing the indices, occupancy, or FIFO. Ordinary, balanced,
+and Host allocation entry points use the same availability updates.
+
+With a stable bucket count, choosing a block examines the bucket-index heads,
+not every parent. Updating the chosen parent's ordering costs logarithmic time
+in the number of indexed parents per bucket. Advancing its free-slot cursor
+only searches that bucket within that parent. The first balanced call after
+ordinary allocations, or an explicit bucket-count change, rebuilds indices
+only for that group's partial parents; production group geometry stays fixed.
+The additional metadata is per-parent bucket minima and at most one tree
+entry per available bucket of a partial parent. Request loads remain derived
+from `BlockTable` on each actual acquire; this optimization introduces no
+request counter that retract, prefix replacement, or table clearing must reset.
+
+References still govern the lifetime of the whole parent binding. Different
+requests may own its children, and a cached-prefix ref can keep it bound after
+the originating request finishes. DCP does not add a second allocator, alter
+prefix identity, or put process groups or GPU work in the scheduler.
+
+DeepSeek V4 shards only compressed-KV groups, with target and MTP fields in
+the same ratio group. DCP>1 splits replicated indexer KV from compressed KV.
+The split fits into the original plane byte budgets; its physical packing is
+independent of D and its capacity effect is accounted separately. DCP1 keeps
+the original grouping and physical plan.
 
 ## Code placement
 

@@ -45,9 +45,14 @@ namespace tokenspeed {
 // group's PrefixCacheIndex, match policy in its PrefixMatcher.
 class GroupAllocator {
 public:
-    explicit GroupAllocator(std::int32_t cache_blocks_per_lcm_block = 1, std::uint32_t group_id = 0)
-        : cache_blocks_per_lcm_block_{cache_blocks_per_lcm_block}, group_id_{group_id} {
+    explicit GroupAllocator(std::int32_t cache_blocks_per_lcm_block = 1, std::uint32_t group_id = 0,
+                            std::int32_t allocation_bucket_count = 1)
+        : cache_blocks_per_lcm_block_{cache_blocks_per_lcm_block},
+          group_id_{group_id},
+          allocation_bucket_count_{allocation_bucket_count} {
         _assert(cache_blocks_per_lcm_block > 0, "cache_blocks_per_lcm_block must be > 0");
+        _assert(allocation_bucket_count > 0 && cache_blocks_per_lcm_block % allocation_bucket_count == 0,
+                "allocation buckets must divide parent packing");
     }
 
     GroupAllocator(const GroupAllocator&) = delete;
@@ -91,7 +96,8 @@ public:
         const std::int32_t old_num_blocks = table.NumBlocks();
         std::vector<CacheBlockRef> block_refs;
         if (plan.num_blocks > 0) {
-            block_refs = pool.AcquireBlocks(group_id_, cache_blocks_per_lcm_block_, plan.num_blocks);
+            block_refs =
+                pool.AcquireBlocks(group_id_, cache_blocks_per_lcm_block_, plan.num_blocks, BucketLoads(table));
             if (static_cast<std::int32_t>(block_refs.size()) < plan.num_blocks) {
                 return false;
             }
@@ -124,7 +130,7 @@ public:
             host_block_refs, [](const CacheBlockRef& block_ref) { return static_cast<bool>(block_ref); }));
         table.blocks_.reserve(table.blocks_.size() + host_block_refs.size());
         std::vector<CacheBlockRef> destination_refs =
-            pool.AcquireBlocks(group_id_, cache_blocks_per_lcm_block_, num_pages);
+            pool.AcquireBlocks(group_id_, cache_blocks_per_lcm_block_, num_pages, BucketLoads(table));
         FatalCheck(static_cast<std::int32_t>(destination_refs.size()) == num_pages,
                    "admission plan no longer fits the block pool");
         auto destination_it = destination_refs.begin();
@@ -210,8 +216,24 @@ public:
     }
 
 private:
+    std::vector<std::int32_t> BucketLoads(const BlockTable& table) const {
+        if (allocation_bucket_count_ == 1) {
+            return {};
+        }
+        std::vector<std::int32_t> loads(static_cast<std::size_t>(allocation_bucket_count_), 0);
+        // Shared prefix refs and allocated headroom both count. Null slots in
+        // sparse tables do not own a placement and contribute nothing.
+        for (const CacheBlockRef& ref : table.Blocks()) {
+            if (ref) {
+                ++loads[static_cast<std::size_t>(ref->Location().slot_index % allocation_bucket_count_)];
+            }
+        }
+        return loads;
+    }
+
     std::int32_t cache_blocks_per_lcm_block_;
     std::uint32_t group_id_;
+    std::int32_t allocation_bucket_count_;
 };
 
 }  // namespace tokenspeed

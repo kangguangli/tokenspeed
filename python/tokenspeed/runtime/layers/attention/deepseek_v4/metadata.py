@@ -7,9 +7,16 @@
 # copies of the Software, and to permit persons to whom the Software is
 # furnished to do so, subject to the following conditions:
 #
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
 # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 # IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 
 from __future__ import annotations
 
@@ -88,6 +95,12 @@ class DeepseekV4IndexerBatchMetadata:
 
 @dataclass
 class DeepseekV4AttentionMetadata:
+    # C128 owner-filtered decode suffix, prepared once per forward/group. The
+    # metadata object owns its target/draft view and topology; keys carry the
+    # group and physical row geometry. Graph replay updates outputs in place.
+    dcp_dense_compressed: dict[
+        tuple[str, int, int], tuple[torch.Tensor, torch.Tensor]
+    ] = field(default_factory=dict)
     decode_swa_indices: torch.Tensor | None = None
     decode_swa_lens: torch.Tensor | None = None
     decode_swa_window_size: int = 0
