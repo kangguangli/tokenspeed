@@ -24,6 +24,73 @@ import torch
 from tokenspeed_kernel._triton import tl, triton
 
 
+@triton.jit
+def _normalize_dcp_partials_kernel(
+    output,
+    lse,
+    swa_lens,
+    extra_lens,
+    normalized_lse,
+    OS_T: tl.constexpr,
+    OS_H: tl.constexpr,
+    OS_D: tl.constexpr,
+    LS_T: tl.constexpr,
+    LS_H: tl.constexpr,
+    HEADS: tl.constexpr,
+    DIM: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    token = tl.program_id(0)
+    head = tl.program_id(1)
+    nonempty = tl.load(swa_lens + token) > 0
+    if extra_lens is not None:
+        nonempty = nonempty | (tl.load(extra_lens + token) > 0)
+    value = tl.load(lse + token * LS_T + head * LS_H)
+    tl.store(
+        normalized_lse + token * HEADS + head, tl.where(nonempty, value, -float("inf"))
+    )
+    if not nonempty:
+        offsets = tl.arange(0, BLOCK)
+        tl.store(output + token * OS_T + head * OS_H + offsets * OS_D, 0, offsets < DIM)
+
+
+def normalize_dcp_partials(
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    swa_lens: torch.Tensor,
+    extra_lens: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Normalize empty FlashMLA partials in one kernel.
+
+    Args:
+        output: CUDA partials [tokens, heads, dim], updated in place only for
+            empty selections. Nonempty values (including NaNs) are preserved.
+        lse: Natural-log FP32 [tokens, heads], possibly strided.
+        swa_lens: Int32 valid SWA lengths [tokens].
+        extra_lens: Optional Int32 compressed lengths [tokens].
+
+    Returns:
+        The input output tensor, and contiguous FP32 LSE. Empty rows become
+        output=0 and LSE=-inf; nonempty rows retain their original bits.
+    """
+    normalized = torch.empty(
+        output.shape[:2], dtype=torch.float32, device=output.device
+    )
+    _normalize_dcp_partials_kernel[(output.shape[0], output.shape[1])](
+        output,
+        lse,
+        swa_lens,
+        extra_lens,
+        normalized,
+        *output.stride(),
+        *lse.stride(),
+        HEADS=output.shape[1],
+        DIM=output.shape[2],
+        BLOCK=triton.next_power_of_2(output.shape[2]),
+    )
+    return output, normalized
+
+
 def pack_dcp_partials(
     output: torch.Tensor, lse: torch.Tensor, degree: int
 ) -> torch.Tensor:

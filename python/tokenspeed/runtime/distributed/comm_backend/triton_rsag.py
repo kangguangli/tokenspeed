@@ -88,8 +88,15 @@ class TritonRSAGBackend:
 
         if (
             current_platform().is_nvidia
+            and current_platform().is_hopper_plus
+            and tensor.is_cuda
             and dim in (-1, tensor.dim() - 1)
             and tensor.dtype == torch.bfloat16
+            and tensor.is_contiguous()
+            and tensor.size(-1) > 0
+            and tensor.size(-1) % 8 == 0
+            and tensor.data_ptr() % 16 == 0
+            and tensor.size(0) <= self._get_max_num_gathered_tokens()
         ):
             hidden_size = tensor.size(-1) * len(group)
             state = self._get_or_create(group, hidden_size)

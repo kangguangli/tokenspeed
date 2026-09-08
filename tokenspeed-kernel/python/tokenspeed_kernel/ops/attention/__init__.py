@@ -3743,10 +3743,17 @@ def dsv4_decode(
     override: str | None = None,
     solution: str | None = None,
     return_lse: bool = False,
+    reuse_schedule: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run DeepSeek V4 selected attention over page-planar FP8 caches.
 
     SWA and optional extra compressed rows form independent selected segments.
+    ``reuse_schedule`` allows sharing a schedule within the current forward
+    for identical length tensors (for example C128 layers). Call
+    ``dsv4_reset_attention_state`` before lengths change; graph capture records
+    schedule generation at its first use, so replay refreshes device values.
+    Backends without a separate schedule may ignore this hint.
+
     Invalid negative slots and entries beyond each segment's per-token length
     do not contribute to attention.
 
@@ -3924,6 +3931,7 @@ def dsv4_decode(
             extra_page_size=extra_page_size,
             out=out,
             **({"return_lse": True} if return_lse else {}),
+            **({"reuse_schedule": True} if reuse_schedule else {}),
         )
 
 

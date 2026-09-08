@@ -253,7 +253,7 @@ class ServerArgs:
 
     # DeepSeek V4
     decode_context_parallel_size: int = 1
-    dcp_comm_backend: Literal["ag_rs", "a2a"] = "ag_rs"
+    dcp_comm_backend: Literal["auto", "peer", "ag_rs", "a2a"] = "auto"
     dcp_dsv4_reference_backend: Literal["selected_kv"] | None = None
     deepseek_v4_mega_moe_max_num_tokens: int = 0
     deepseek_v4_indexer_prefill_max_logits_mb: int = 512
@@ -2039,9 +2039,9 @@ class ServerArgs:
         )
         parser.add_argument(
             "--dcp-comm-backend",
-            choices=("ag_rs", "a2a"),
+            choices=("auto", "peer", "ag_rs", "a2a"),
             default=ServerArgs.dcp_comm_backend,
-            help="Communication used to combine DCP attention partials.",
+            help="DCP partial combine: auto selects peer exchange with NCCL a2a fallback; peer requires the custom kernel.",
         )
         parser.add_argument(
             "--dcp-dsv4-reference-backend",

@@ -304,7 +304,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self.dcp_size = getattr(config, "dcp_size", 1)
         self.dcp_rank = getattr(config, "dcp_rank", 0)
         self.dcp_group = getattr(config, "dcp_group", ())
-        self.dcp_comm_backend = getattr(config, "dcp_comm_backend", "ag_rs")
+        self.dcp_comm_backend = getattr(config, "dcp_comm_backend", "auto")
         self.dcp_reference_backend = getattr(config, "dcp_reference_backend", None)
         # Per-sliding-group [max_bs] int32 buffers mirroring the block-table
         # buffers; populated by init_cuda_graph_state.
@@ -836,11 +836,18 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 self._cuda_graph_draft_decode_metadata[bs] = metadata
             self._draft_decode_metadata = metadata
             self._refresh_dcp_dense_compressed_metadata(metadata)
+            if self._decode_swa_window_size > 0 and self._decode_swa_block_size > 0:
+                self._update_decode_swa_metadata(
+                    metadata,
+                    window_size=self._decode_swa_window_size,
+                    block_size=self._decode_swa_block_size,
+                )
             return
 
         metadata.req_pool_indices = prefill_metadata.req_pool_indices
         metadata.cache = prefill_metadata.cache
         metadata.seq_lens.copy_(base_seq_lens)
+        metadata.decode_slices.clear()
         if is_valid_token is None:
             metadata.is_valid_token = None
         else:
@@ -854,6 +861,12 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         metadata.num_prefill_reqs = 0
         metadata.num_prefill_tokens = 0
         metadata.forward_mode = ForwardMode.DECODE
+        if self._decode_swa_window_size > 0 and self._decode_swa_block_size > 0:
+            self._update_decode_swa_metadata(
+                metadata,
+                window_size=self._decode_swa_window_size,
+                block_size=self._decode_swa_block_size,
+            )
         # Reuse path: cached decode-indexer plans still describe the previous
         # prefill. Refresh after updating seq_lens so draft step 0 does not
         # reuse stale context_lens / page_table tensors.
@@ -1191,6 +1204,29 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 )
         elif forward_mode is not None and forward_mode.is_extend_or_mixed():
             self.forward_prefill_metadata = self.forward_metadata
+
+    def _get_decode_swa_metadata(
+        self,
+        metadata: DeepseekV4ForwardMetadata,
+        *,
+        window_size: int,
+        block_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Metadata setup refreshes values on each step/replay. Layers only
+        # reuse that step's result; shape alone never validates a new step.
+        attention = metadata.attention
+        if (
+            attention.decode_swa_indices is not None
+            and attention.decode_swa_lens is not None
+            and attention.decode_swa_window_size == window_size
+            and attention.decode_swa_block_size == block_size
+            and attention.decode_swa_indices.shape[0]
+            == metadata.token_to_req_indices.numel()
+        ):
+            return attention.decode_swa_indices, attention.decode_swa_lens
+        return self._update_decode_swa_metadata(
+            metadata, window_size=window_size, block_size=block_size
+        )
 
     def _update_decode_swa_metadata(
         self,
@@ -1660,7 +1696,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
     ) -> torch.Tensor:
         metadata = self.forward_metadata
         assert metadata is not None
-        swa_slots, swa_lens = self._update_decode_swa_metadata(
+        swa_slots, swa_lens = self._get_decode_swa_metadata(
             metadata,
             window_size=window_size,
             block_size=token_to_kv_pool.swa_block_size,
@@ -1699,7 +1735,13 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 softmax_scale,
             )
         # SWA is replicated. Count it on exactly one context shard.
-        local_swa_lens = swa_lens if self.dcp_rank == 0 else torch.zeros_like(swa_lens)
+        local_swa_lens = swa_lens
+        if self.dcp_rank != 0:
+            zero_lens = metadata.attention.decode_dcp_zero_swa_lens
+            if zero_lens is None or zero_lens.shape != swa_lens.shape:
+                zero_lens = torch.zeros_like(swa_lens)
+                metadata.attention.decode_dcp_zero_swa_lens = zero_lens
+            local_swa_lens = zero_lens
         rows = token_to_kv_pool.get_compressed_block_size(layer_id)
         extra_slots, extra_lens = self._decode_compressed_attention_indices_and_lens(
             positions,
@@ -1729,6 +1771,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             extra_lens=extra_lens,
             extra_page_size=rows,
             return_lse=True,
+            reuse_schedule=compress_ratio == 128,
         )
         return combine_attention_partials(
             partial[:, :actual_heads],
@@ -2100,6 +2143,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         token_end: int,
         forward_mode: ForwardMode,
     ) -> DeepseekV4ForwardMetadata:
+        slice_key = (req_start, req_end, token_start, token_end)
+        if forward_mode.is_decode() and slice_key in metadata.decode_slices:
+            return metadata.decode_slices[slice_key]
         token_to_req = metadata.token_to_req_indices[token_start:token_end].to(
             torch.int32
         ) - int(req_start)
@@ -2200,6 +2246,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 )
                 if count == metadata.decode_token_count()
             }
+            metadata.decode_slices[slice_key] = sliced
         return sliced
 
     def _forward_deepseek_v4_prefill_chunk(
@@ -2708,6 +2755,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             metadata.query_lens_cpu = None
             metadata.forward_mode = metadata_forward_mode
         self._cuda_graph_metadata[bs] = metadata
+        metadata.decode_slices.clear()
         self._refresh_dcp_dense_compressed_metadata(metadata)
         if is_packed_decode and getattr(self, "is_draft", False):
             self._prepare_draft_decode_metadata(
@@ -2874,6 +2922,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         )
         metadata.num_prefill_reqs = 0
         metadata.num_prefill_tokens = 0
+        metadata.decode_slices.clear()
         self._refresh_dcp_dense_compressed_metadata(metadata)
         if is_packed_decode and getattr(self, "is_draft", False):
             self._prepare_draft_decode_metadata(
@@ -2913,8 +2962,10 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             or self._draft_decode_metadata is None
         ):
             raise RuntimeError("DeepSeek V4 draft metadata was not initialized")
+        dsv4_reset_attention_state()
         self._draft_decode_step += 1
         metadata = self._draft_decode_metadata
+        metadata.decode_slices.clear()
         if seq_lens is None:
             metadata.seq_lens.add_(1)
         else:

@@ -103,6 +103,7 @@ class DeepseekV4AttentionMetadata:
     ] = field(default_factory=dict)
     decode_swa_indices: torch.Tensor | None = None
     decode_swa_lens: torch.Tensor | None = None
+    decode_dcp_zero_swa_lens: torch.Tensor | None = None
     decode_swa_window_size: int = 0
     decode_swa_block_size: int = 0
     # Cache for dense compressed decode attention indices/lens. CSA decode uses
@@ -161,6 +162,11 @@ class DeepseekV4ForwardMetadata:
     # Cached split boundary derived from scheduler num_extends/query_lens.
     num_prefill_reqs: int = 0
     num_prefill_tokens: int = 0
+    # Mixed forwards reuse one decode metadata view across layers. A new
+    # forward owns a fresh dictionary; in-place replay/draft refresh clears it.
+    decode_slices: dict[tuple[int, int, int, int], "DeepseekV4ForwardMetadata"] = field(
+        default_factory=dict
+    )
 
     def decode_req_count(self) -> int:
         return max(0, int(self.req_pool_indices.shape[0]) - int(self.num_prefill_reqs))

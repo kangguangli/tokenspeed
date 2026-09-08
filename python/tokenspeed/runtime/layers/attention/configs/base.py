@@ -162,7 +162,7 @@ class AttnConfig:
     dcp_size: int = 1
     dcp_rank: int = 0
     dcp_group: tuple[int, ...] = (0,)
-    dcp_comm_backend: str = "ag_rs"
+    dcp_comm_backend: str = "auto"
     dcp_reference_backend: str | None = None
     components: tuple[AttnComponentSpec, ...]
 
