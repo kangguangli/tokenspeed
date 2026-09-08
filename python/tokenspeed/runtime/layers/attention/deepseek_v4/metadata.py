@@ -95,8 +95,8 @@ class DeepseekV4IndexerBatchMetadata:
 
 @dataclass
 class DeepseekV4CompressedAttentionMetadata:
-    indices: torch.Tensor | None
-    # Scan lengths precede owner masking and are shared across layers.
+    indices: torch.Tensor
+    # Scan lengths precede owner masking and have equal values across layers.
     lens: torch.Tensor
     # Actual local counts are needed to normalize empty DCP partials.
     valid_lens: torch.Tensor | None = None
@@ -109,15 +109,16 @@ class DeepseekV4AttentionMetadata:
     decode_dcp_zero_swa_lens: torch.Tensor | None = None
     decode_swa_window_size: int = 0
     decode_swa_block_size: int = 0
-    # C128 caches the full selection; C4 caches only invariant scan lengths.
+    # Only dense C128 selection is cached. C4 maps and counts top-k every layer.
     decode_compressed_cache: dict[
-        tuple[int, int, int, int, int], DeepseekV4CompressedAttentionMetadata
+        tuple[int, int, int, int], DeepseekV4CompressedAttentionMetadata
     ] = field(default_factory=dict)
-    decode_compressed_capture_safe_keys: set[tuple[int, int, int, int, int]] = field(
+    decode_compressed_capture_safe_keys: set[tuple[int, int, int, int]] = field(
         default_factory=set
     )
 
     def clear_compressed_cache(self) -> None:
+        """Invalidate C128 selection when reused metadata inputs change."""
         self.decode_compressed_cache.clear()
         self.decode_compressed_capture_safe_keys.clear()
 

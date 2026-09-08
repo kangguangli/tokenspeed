@@ -1245,16 +1245,58 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         if compress_ratio == 4 and topk_indices is None:
             raise RuntimeError("DeepSeek V4 CSA decode requires top-k indices")
         num_tokens = positions.numel()
-        width = (
-            topk_indices.shape[-1]
-            if compress_ratio == 4
-            else self._dense_compressed_indices_width(compress_ratio)
+        is_valid_token = (
+            metadata.is_valid_token[:num_tokens]
+            if metadata.is_valid_token is not None
+            else None
         )
+        if compress_ratio == 4:
+            valid_lens = None
+            if self.dcp_size > 1:
+                lens = torch.empty(
+                    num_tokens, dtype=torch.int32, device=positions.device
+                )
+                indices_2d, valid_lens, _ = self._dcp_selected_compressed_rows(
+                    positions,
+                    compress_ratio=compress_ratio,
+                    block_size=block_size,
+                    topk_indices=topk_indices,
+                    out_scan_lens=lens,
+                )
+            else:
+                page_table = metadata.cache.compressed_page_table(
+                    compress_ratio, block_size
+                )
+                base_offsets = (
+                    _compressed_block_table_base_offsets(metadata, compress_ratio)
+                    if page_table is not metadata.cache.page_table
+                    else None
+                )
+                topk_local = topk_indices
+                if base_offsets is not None:
+                    req_idx = metadata.token_to_req_indices[:num_tokens].to(torch.int64)
+                    base_slots = base_offsets.to(
+                        device=positions.device, dtype=torch.int64
+                    )[req_idx] * int(block_size)
+                    topk_i64 = topk_indices.to(torch.int64)
+                    topk_local = torch.where(
+                        topk_i64 >= 0, topk_i64 - base_slots[:, None], topk_i64
+                    ).to(topk_indices.dtype)
+                indices_2d, lens = dsv4_compute_global_topk_indices_and_lens(
+                    topk_indices=topk_local,
+                    token_to_req_indices=metadata.token_to_req_indices[:num_tokens],
+                    block_table=page_table,
+                    block_size=block_size,
+                    is_valid_token=is_valid_token,
+                )
+            return DeepseekV4CompressedAttentionMetadata(
+                indices=indices_2d.unsqueeze(1), lens=lens, valid_lens=valid_lens
+            )
+
         cache_key = (
             int(compress_ratio),
             int(block_size),
             int(num_tokens),
-            int(width),
             int(positions.data_ptr()) if num_tokens else 0,
         )
         attention = metadata.attention
@@ -1265,33 +1307,17 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         if capturing and cache_key not in capture_safe_keys:
             # Warmup tensors cannot replace computations that replay must run.
             cached = None
-        if cached is not None and compress_ratio != 4:
+        if cached is not None:
             return cached
 
-        is_valid_token = (
-            metadata.is_valid_token[:num_tokens]
-            if metadata.is_valid_token is not None
-            else None
+        width = self._dense_compressed_indices_width(compress_ratio)
+        lens = (
+            torch.div(positions + 1, compress_ratio, rounding_mode="floor")
+            .clamp(0, width)
+            .to(torch.int32)
         )
-        if cached is not None:
-            lens = cached.lens
-        else:
-            if compress_ratio == 4:
-                # The indexer selects min(K, context length) entries, then pads
-                # with -1. This bound is layer invariant before owner filtering.
-                # Use the last candidate offset so holes never truncate a tail.
-                offsets = torch.arange(
-                    1, width + 1, device=positions.device, dtype=torch.int32
-                )
-                lens = torch.where(topk_indices >= 0, offsets, 0).amax(dim=-1)
-            else:
-                lens = (
-                    torch.div(positions + 1, compress_ratio, rounding_mode="floor")
-                    .clamp(0, width)
-                    .to(torch.int32)
-                )
-            if is_valid_token is not None:
-                lens = torch.where(is_valid_token, lens, 0)
+        if is_valid_token is not None:
+            lens = torch.where(is_valid_token, lens, 0)
 
         valid_lens = None
         if self.dcp_size > 1:
@@ -1311,52 +1337,26 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 if page_table is not metadata.cache.page_table
                 else None
             )
-            if compress_ratio == 4:
-                topk_local = topk_indices
-                if base_offsets is not None:
-                    base_slots = base_offsets.to(
-                        device=positions.device, dtype=torch.int64
-                    )[req_idx] * int(block_size)
-                    topk_i64 = topk_indices.to(torch.int64)
-                    topk_local = torch.where(
-                        topk_i64 >= 0, topk_i64 - base_slots[:, None], topk_i64
-                    ).to(topk_indices.dtype)
-                indices_2d, _ = dsv4_compute_global_topk_indices_and_lens(
-                    topk_indices=topk_local,
-                    token_to_req_indices=metadata.token_to_req_indices[:num_tokens],
-                    block_table=page_table,
-                    block_size=block_size,
-                    is_valid_token=is_valid_token,
+            offsets = torch.arange(width, dtype=torch.int64, device=positions.device)
+            valid = offsets[None, :] < lens[:, None]
+            local = torch.where(valid, offsets[None, :], 0)
+            pages = torch.div(local, block_size, rounding_mode="floor")
+            if base_offsets is not None:
+                pages = (
+                    pages
+                    - base_offsets.to(device=positions.device, dtype=torch.int64)[
+                        req_idx, None
+                    ]
                 )
-            else:
-                offsets = torch.arange(
-                    width, dtype=torch.int64, device=positions.device
-                )
-                valid = offsets[None, :] < lens[:, None]
-                local = torch.where(valid, offsets[None, :], 0)
-                pages = torch.div(local, block_size, rounding_mode="floor")
-                if base_offsets is not None:
-                    pages = (
-                        pages
-                        - base_offsets.to(device=positions.device, dtype=torch.int64)[
-                            req_idx, None
-                        ]
-                    )
-                page_ids = metadata.cache.safe_page_ids(
-                    page_table, req_idx[:, None], pages.long()
-                )
-                slots = page_ids * block_size + local % block_size
-                indices_2d = torch.where(valid & (page_ids >= 0), slots, -1).to(
-                    torch.int32
-                )
+            page_ids = metadata.cache.safe_page_ids(
+                page_table, req_idx[:, None], pages.long()
+            )
+            slots = page_ids * block_size + local % block_size
+            indices_2d = torch.where(valid & (page_ids >= 0), slots, -1).to(torch.int32)
         result = DeepseekV4CompressedAttentionMetadata(
             indices=indices_2d.unsqueeze(1), lens=lens, valid_lens=valid_lens
         )
-        cache[cache_key] = (
-            DeepseekV4CompressedAttentionMetadata(indices=None, lens=lens)
-            if compress_ratio == 4
-            else result
-        )
+        cache[cache_key] = result
         if capturing:
             capture_safe_keys.add(cache_key)
         return result
@@ -1411,6 +1411,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         block_size: int,
         topk_indices: torch.Tensor | None,
         return_global_valid: bool = False,
+        out_scan_lens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         metadata = self.forward_metadata
         if metadata is None:
@@ -1446,6 +1447,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             ),
             compact=False,
             return_global_valid=return_global_valid,
+            out_scan_lens=out_scan_lens,
         )
 
     def forward_deepseek_v4_decode(

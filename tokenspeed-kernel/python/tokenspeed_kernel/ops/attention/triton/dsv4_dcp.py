@@ -38,6 +38,7 @@ def _selected_slots(
     output,
     lengths,
     global_mask,
+    scan_lengths,
     topk_stride,
     table_stride,
     num_requests,
@@ -59,10 +60,15 @@ def _selected_slots(
     position = tl.load(positions + query)
     causal_count = tl.maximum((position + 1) // RATIO, 0)
     req = tl.load(token_to_req + query)
-    valid = (offsets < WIDTH) & (selected >= 0) & (selected < causal_count)
-    valid &= (req >= 0) & (req < num_requests)
+    query_valid = (req >= 0) & (req < num_requests)
     if valid_tokens is not None:
-        valid &= tl.load(valid_tokens + query)
+        query_valid &= tl.load(valid_tokens + query)
+    candidates_valid = (offsets < WIDTH) & (selected >= 0) & query_valid
+    if scan_lengths is not None:
+        # Preserve the original prefix even when filtering leaves interior holes.
+        scan_length = tl.max(tl.where(candidates_valid, offsets + 1, 0), 0)
+        tl.store(scan_lengths + query, scan_length)
+    valid = candidates_valid & (selected < causal_count)
     safe_req = tl.minimum(tl.maximum(req, 0), num_requests - 1)
     page_column = tl.maximum(selected, 0) // ROWS
     if base_offsets is not None:
@@ -116,6 +122,7 @@ def dsv4_dcp_selected_slots(
     out_slots: torch.Tensor | None = None,
     out_lens: torch.Tensor | None = None,
     return_global_valid: bool = True,
+    out_scan_lens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Filter global compressed entry IDs by causality, table validity and owner.
 
@@ -142,12 +149,18 @@ def dsv4_dcp_selected_slots(
         out_lens: Optional contiguous int32 output [queries], on the same device.
         return_global_valid: Allocate and return the global validity mask. The
             formal partial path can disable this unused diagnostic output.
+        out_scan_lens: Optional contiguous int32 output [queries] on the same
+            device. Receives the original prefix ending at the last nonnegative
+            candidate, before causal, table and owner filtering. Invalid queries
+            and empty tables produce zero. For C4's trailing -1 padding this is
+            min(K, context length), computed in the slot-mapping kernel.
 
     Returns:
         Local int32 slots [queries, width], actual local int32 counts [queries],
         and the global boolean validity mask [queries, width], or None when
         disabled. Invalid local slots are -1; consuming kernels must form safe
-        masked addresses. Supplied outputs are returned without replacement.
+        masked addresses. Supplied slot/count outputs are returned without
+        replacement; out_scan_lens is updated in place.
     """
     if candidates.ndim != 2 or candidates.dtype != torch.int32:
         raise ValueError("DCP candidates must be a two-dimensional int32 tensor")
@@ -177,7 +190,11 @@ def dsv4_dcp_selected_slots(
         raise ValueError("DCP selection tensors must share a device")
     if is_valid_token is not None and is_valid_token.numel() != queries:
         raise ValueError("DCP query validity must cover all queries")
-    for tensor, shape in ((out_slots, candidates.shape), (out_lens, (queries,))):
+    for tensor, shape in (
+        (out_slots, candidates.shape),
+        (out_lens, (queries,)),
+        (out_scan_lens, (queries,)),
+    ):
         if tensor is not None and (
             tensor.shape != shape
             or tensor.dtype != torch.int32
@@ -205,6 +222,8 @@ def dsv4_dcp_selected_slots(
         lengths.zero_()
         if global_valid is not None:
             global_valid.zero_()
+        if out_scan_lens is not None:
+            out_scan_lens.zero_()
         return output, lengths, global_valid
     if candidates.is_cuda:
         table = block_table.to(torch.int32).contiguous()
@@ -223,6 +242,7 @@ def dsv4_dcp_selected_slots(
             output,
             lengths,
             global_valid,
+            out_scan_lens,
             selected.stride(0),
             table.stride(0),
             table.shape[0],
@@ -242,6 +262,8 @@ def dsv4_dcp_selected_slots(
         lengths.zero_()
         if global_valid is not None:
             global_valid.zero_()
+        if out_scan_lens is not None:
+            out_scan_lens.zero_()
         # Independent scalar reference; CPU tests exercise non-cyclic logical
         # order, causal holes and skewed selection instead of GPU arithmetic.
         for query in range(queries):
@@ -258,6 +280,8 @@ def dsv4_dcp_selected_slots(
                 else 0
             )
             for column, entry in enumerate(candidates[query].tolist()):
+                if out_scan_lens is not None and entry >= 0:
+                    out_scan_lens[query] = column + 1
                 page_column = entry // rows_per_page - base
                 if (
                     not 0 <= entry < causal
