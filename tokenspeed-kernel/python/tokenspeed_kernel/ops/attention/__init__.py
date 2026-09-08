@@ -3743,16 +3743,17 @@ def dsv4_decode(
     override: str | None = None,
     solution: str | None = None,
     return_lse: bool = False,
-    reuse_schedule: bool = False,
+    extra_valid_lens: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run DeepSeek V4 selected attention over page-planar FP8 caches.
 
     SWA and optional extra compressed rows form independent selected segments.
-    ``reuse_schedule`` allows sharing a schedule within the current forward
-    for identical length tensors (for example C128 layers). Call
-    ``dsv4_reset_attention_state`` before lengths change; graph capture records
-    schedule generation at its first use, so replay refreshes device values.
-    Backends without a separate schedule may ignore this hint.
+    For each query/cache geometry, scan-length values must remain the same
+    within a forward. Schedules are shared even when length tensors are rebuilt,
+    independently of ``return_lse``. Call ``dsv4_reset_attention_state`` before
+    changing length values, including when replacing tensors. Graph capture
+    records schedule generation at first use, so replay refreshes device values.
+    Other backends may have no separate schedule.
 
     Invalid negative slots and entries beyond each segment's per-token length
     do not contribute to attention.
@@ -3773,13 +3774,19 @@ def dsv4_decode(
         extra_slots: Selected global slots in ``extra_kv_cache``. Nonnegative
             entries in each active prefix must be smaller than
             ``extra_pages * extra_page_size``.
-        extra_lens: Valid extra selection length for each query token.
+        extra_lens: Extra scan length for each query token, including any -1
+            holes inside that prefix. Owner filtering must not shorten it when
+            indices retain their original order.
         extra_page_size: Number of rows in each extra cache page.
         out: Optional output shaped like ``q``.
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
         return_lse: Return a no-sink partial and its natural-log LSE. Requires
             attn_sink=None and an explicitly compatible kernel.
+        extra_valid_lens: Optional count of nonnegative extra slots within each
+            scanned prefix, as contiguous int32 [tokens]. Supply it with
+            return_lse=True when extra_lens includes masked holes, so an empty
+            local selection is normalized correctly. This count does not affect scheduling.
 
     Returns:
         BF16 attention output shaped like ``q``. With return_lse=True, also
@@ -3843,6 +3850,17 @@ def dsv4_decode(
             for tensor in (extra_kv_cache, extra_slots, extra_lens)
         ):
             raise ValueError("all extra selected-attention tensors must share a device")
+    if extra_valid_lens is not None:
+        if not return_lse or extra_lens is None:
+            raise ValueError(
+                "extra_valid_lens requires an extra segment and return_lse"
+            )
+        if extra_valid_lens.shape != (tokens,) or not extra_valid_lens.is_contiguous():
+            raise ValueError(
+                "extra_valid_lens must be contiguous with one entry per query token"
+            )
+        if extra_valid_lens.dtype != torch.int32 or extra_valid_lens.device != q.device:
+            raise ValueError("extra_valid_lens must be int32 on the query device")
     if out is not None and (
         out.shape != q.shape or out.dtype != q.dtype or out.device != q.device
     ):
@@ -3931,7 +3949,11 @@ def dsv4_decode(
             extra_page_size=extra_page_size,
             out=out,
             **({"return_lse": True} if return_lse else {}),
-            **({"reuse_schedule": True} if reuse_schedule else {}),
+            **(
+                {"extra_valid_lens": extra_valid_lens}
+                if extra_valid_lens is not None
+                else {}
+            ),
         )
 
 

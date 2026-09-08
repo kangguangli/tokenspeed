@@ -690,7 +690,6 @@ def triton_dsv4_decode(
     extra_lens: torch.Tensor | None = None,
     extra_page_size: int | None = None,
     out: torch.Tensor | None = None,
-    reuse_schedule: bool = False,
 ) -> torch.Tensor:
     """Compose page-planar dequantization with registered dense attention."""
     from tokenspeed_kernel.ops.attention import dsv4_prefill

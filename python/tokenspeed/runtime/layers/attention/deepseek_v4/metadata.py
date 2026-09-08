@@ -94,24 +94,32 @@ class DeepseekV4IndexerBatchMetadata:
 
 
 @dataclass
+class DeepseekV4CompressedAttentionMetadata:
+    indices: torch.Tensor | None
+    # Scan lengths precede owner masking and are shared across layers.
+    lens: torch.Tensor
+    # Actual local counts are needed to normalize empty DCP partials.
+    valid_lens: torch.Tensor | None = None
+
+
+@dataclass
 class DeepseekV4AttentionMetadata:
-    # C128 local decode slots, prepared once per forward. CUDA graph replay
-    # updates these tensors in place; mixed decode slices share their storage.
-    dcp_c128_slots: torch.Tensor | None = None
-    dcp_c128_lens: torch.Tensor | None = None
     decode_swa_indices: torch.Tensor | None = None
     decode_swa_lens: torch.Tensor | None = None
     decode_dcp_zero_swa_lens: torch.Tensor | None = None
     decode_swa_window_size: int = 0
     decode_swa_block_size: int = 0
-    # Cache for dense compressed decode attention indices/lens. CSA decode uses
-    # dynamic top-k indices and does not populate this cache.
-    decode_dense_compressed_indices_cache: dict[
-        tuple[int, int, int, int], tuple[torch.Tensor, torch.Tensor]
+    # C128 caches the full selection; C4 caches only invariant scan lengths.
+    decode_compressed_cache: dict[
+        tuple[int, int, int, int, int], DeepseekV4CompressedAttentionMetadata
     ] = field(default_factory=dict)
-    decode_dense_compressed_indices_capture_safe_keys: set[
-        tuple[int, int, int, int]
-    ] = field(default_factory=set)
+    decode_compressed_capture_safe_keys: set[tuple[int, int, int, int, int]] = field(
+        default_factory=set
+    )
+
+    def clear_compressed_cache(self) -> None:
+        self.decode_compressed_cache.clear()
+        self.decode_compressed_capture_safe_keys.clear()
 
 
 @dataclass
@@ -160,11 +168,6 @@ class DeepseekV4ForwardMetadata:
     # Cached split boundary derived from scheduler num_extends/query_lens.
     num_prefill_reqs: int = 0
     num_prefill_tokens: int = 0
-    # Mixed forwards reuse one decode metadata view across layers. A new
-    # forward owns a fresh dictionary; in-place replay/draft refresh clears it.
-    decode_slices: dict[tuple[int, int, int, int], "DeepseekV4ForwardMetadata"] = field(
-        default_factory=dict
-    )
 
     def decode_req_count(self) -> int:
         return max(0, int(self.req_pool_indices.shape[0]) - int(self.num_prefill_reqs))

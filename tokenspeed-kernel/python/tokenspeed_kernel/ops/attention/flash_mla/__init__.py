@@ -188,7 +188,6 @@ def _get_dsv4_tile_meta(
     page_size: int,
     extra_page_size: int | None,
     extra_selected_width: int,
-    length_identity: tuple = (),
 ) -> object:
     phase = "graph" if torch.cuda.is_current_stream_capturing() else "eager"
     key = (
@@ -200,7 +199,6 @@ def _get_dsv4_tile_meta(
         int(page_size),
         int(extra_page_size or 0),
         int(extra_selected_width),
-        length_identity,
     )
     meta = _dsv4_tile_meta_cache.get(key)
     if meta is not None and getattr(meta, "have_initialized", False):
@@ -387,7 +385,7 @@ if (
         extra_page_size: int | None = None,
         out: torch.Tensor | None = None,
         return_lse: bool = False,
-        reuse_schedule: bool = False,
+        extra_valid_lens: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if return_lse and attn_sink is not None:
             raise ValueError("FlashMLA DCP partials must omit the sink")
@@ -415,28 +413,16 @@ if (
             block_table=None,
             cache_seqlens=None,
             head_dim_v=q.shape[-1],
-            # C4 lengths depend on per-layer top-k and need a fresh schedule.
-            # C128 shares the same prepared lengths within this forward. The
-            # first call records schedule generation in the graph, and reset
-            # clears the Python cache before the next eager forward/capture.
-            tile_scheduler_metadata=(
-                get_mla_metadata()[0]
-                if return_lse and not reuse_schedule
-                else _get_dsv4_tile_meta(
-                    q_kernel,
-                    swa_indices.shape[-1],
-                    swa_page_size,
-                    extra_page_size,
-                    0 if extra_slots is None else extra_slots.shape[-1],
-                    length_identity=(
-                        (
-                            swa_lens.data_ptr(),
-                            0 if extra_lens is None else extra_lens.data_ptr(),
-                        )
-                        if return_lse
-                        else ()
-                    ),
-                )
+            # For each geometry, scan lengths are layer invariant in both
+            # TP and DCP, including newly sliced mixed metadata. Cache by
+            # geometry, not tensor addresses or return_lse. Reset before scan
+            # length values change; owner masking only changes the indices.
+            tile_scheduler_metadata=_get_dsv4_tile_meta(
+                q_kernel,
+                swa_indices.shape[-1],
+                swa_page_size,
+                extra_page_size,
+                0 if extra_slots is None else extra_slots.shape[-1],
             ),
             softmax_scale=float(softmax_scale),
             is_fp8_kvcache=True,
@@ -460,7 +446,12 @@ if (
                 normalize_dcp_partials,
             )
 
-            result, lse = normalize_dcp_partials(result, lse, swa_lens, extra_lens)
+            result, lse = normalize_dcp_partials(
+                result,
+                lse,
+                swa_lens,
+                extra_lens if extra_valid_lens is None else extra_valid_lens,
+            )
         if out is not None:
             out.copy_(result)
             result = out

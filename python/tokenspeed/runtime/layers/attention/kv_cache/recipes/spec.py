@@ -67,10 +67,7 @@ class CacheGroupSpec:
     shard_count: int = 1
 
     def __post_init__(self) -> None:
-        if (
-            not isinstance(self.shard_count, int)
-            or self.shard_count <= 0
-        ):
+        if not isinstance(self.shard_count, int) or self.shard_count <= 0:
             raise ValueError("shard_count must be a positive integer")
         has_rows = (
             self.rows_per_page is not None or self.entry_stride_tokens is not None

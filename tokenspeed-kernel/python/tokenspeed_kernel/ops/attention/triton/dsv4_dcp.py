@@ -135,7 +135,8 @@ def dsv4_dcp_selected_slots(
             in a compact table. Candidate IDs remain absolute entry IDs.
         is_valid_token: Optional mask for padded graph queries.
         compact: Pack owned slots into a dense prefix. False preserves global
-            selection order for diagnostic selected-KV reconstruction.
+            selection order, replacing nonlocal entries with -1; attention must
+            then scan the original prefix, not the returned local count.
         out_slots: Optional contiguous int32 output [queries, width], used to
             refresh metadata referenced by a captured graph at a stable address.
         out_lens: Optional contiguous int32 output [queries], on the same device.
@@ -143,7 +144,7 @@ def dsv4_dcp_selected_slots(
             formal partial path can disable this unused diagnostic output.
 
     Returns:
-        Local int32 slots [queries, width], local int32 lengths [queries],
+        Local int32 slots [queries, width], actual local int32 counts [queries],
         and the global boolean validity mask [queries, width], or None when
         disabled. Invalid local slots are -1; consuming kernels must form safe
         masked addresses. Supplied outputs are returned without replacement.

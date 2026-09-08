@@ -302,7 +302,6 @@ if current_platform().is_amd:
         tags={"amd", "gfx950", "paged_cache", "selected_attention"},
     )
     def gluon_dsv4_decode_split_gfx950(*args, **kwargs):
-        kwargs.pop("reuse_schedule", None)
         return _dsv4_decode_split_impl(*args, **kwargs)
 
     @register_kernel(
