@@ -83,10 +83,11 @@ class CacheBatchMetadata:
             raise ValueError("forward_op must not be None")
         require_positive_int("num_reqs", num_requests)
         group_ids = tuple(spec.group_id for spec in contract.group_specs)
+        counts = contract.virtual_block_counts
         max_page_ids = {
             group_id: require_positive_int(
                 f"max page ID for {group_id!r}",
-                contract.group_address_spaces[group_id].virtual_block_count - 1,
+                counts[group_id] - 1,
             )
             for group_id in group_ids
         }

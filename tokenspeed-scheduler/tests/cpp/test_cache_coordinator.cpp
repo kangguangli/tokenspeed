@@ -769,7 +769,7 @@ TEST(CacheCoordinatorAdmissionTest, UsesPoolAllocationOrderForEmptyParents) {
 
 TEST(CacheCoordinatorAdmissionTest, PacksSlotsFromOneNewParentTogether) {
     BlockPool pool(2);
-    std::vector<CacheBlockRef> held = pool.AcquireBlocks(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1, /*num=*/2);
+    std::vector<CacheBlockRef> held = pool.AcquireBlocks(/*group_id=*/1, /*cache_blocks_per_lcm_block=*/1, /*num=*/2);
     ASSERT_EQ(held.size(), 2u);
     const CacheBlockLocation first_released = held[1]->Location();
     held[1].reset();

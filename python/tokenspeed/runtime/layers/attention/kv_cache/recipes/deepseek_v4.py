@@ -226,6 +226,10 @@ class DeepseekV4Recipe(CacheRecipe):
     # ---- geometry ----
 
     @property
+    def dcp_size(self) -> int:
+        return getattr(self.attn_config, "dcp_size", 1)
+
+    @property
     @override
     def max_padding_fraction(self) -> float:
         # Splitting a replicated indexer from compressed KV creates narrow
@@ -278,14 +282,9 @@ class DeepseekV4Recipe(CacheRecipe):
             fields are added, so the two halves cannot drift apart.
             """
             existing = declared.get(spec.group_id)
-            sharded = split_indexer and spec.group_id in (
-                v4_compressed_kv_group_id(4),
-                v4_compressed_kv_group_id(128),
-            )
-            declared[spec.group_id] = CacheGroupDeclaration(
-                spec if existing is None else existing.spec,
-                (() if existing is None else existing.fields) + fields,
-                "virtual_block_cyclic" if sharded else "replicated",
+            declared[spec.group_id] = (
+                spec if existing is None else existing[0],
+                (() if existing is None else existing[1]) + fields,
             )
 
         swa_spec = v4_swa_kv_spec(self.model_config.hf_config)
@@ -306,7 +305,10 @@ class DeepseekV4Recipe(CacheRecipe):
             if ratio == 1:
                 continue
 
-            compressed_spec = v4_compressed_kv_spec(ratio)
+            compressed_spec = replace(
+                v4_compressed_kv_spec(ratio),
+                shard_count=self.dcp_size if split_indexer else 1,
+            )
             state_spec = v4_compressor_state_spec(ratio, c4_state_window=c4_window)
             compressed_slot = occurrences[compressed_spec.group_id]
             occurrences[compressed_spec.group_id] += 1
@@ -342,7 +344,7 @@ class DeepseekV4Recipe(CacheRecipe):
             # DCP keeps global indexer K replicated in an independent group.
             # Its field rows and plane numbering retain the DCP1 geometry.
             indexer_spec = (
-                replace(compressed_spec, group_id=V4_INDEXER_KV_GROUP_ID)
+                replace(compressed_spec, group_id=V4_INDEXER_KV_GROUP_ID, shard_count=1)
                 if split_indexer
                 else compressed_spec
             )
@@ -378,8 +380,7 @@ class DeepseekV4Recipe(CacheRecipe):
             return groups
         policies = apply_pd_transfer_policies(tuple(spec for spec, _ in groups))
         return tuple(
-            replace(declaration, spec=spec)
-            for spec, declaration in zip(policies, groups, strict=True)
+            (spec, fields) for spec, (_, fields) in zip(policies, groups, strict=True)
         )
 
     # ---- packing: powers of two so every field stride stays aligned ----
@@ -394,16 +395,16 @@ class DeepseekV4Recipe(CacheRecipe):
             baseline = self._replicated_layout
             packing = dict(baseline.group_packing)
             planes = dict(baseline.plane_bytes)
-            for declaration in groups:
-                if declaration.spec.group_id != V4_INDEXER_KV_GROUP_ID:
+            for spec, fields in groups:
+                if spec.group_id != V4_INDEXER_KV_GROUP_ID:
                     continue
                 by_plane = Counter()
-                for field in declaration.fields:
+                for field in fields:
                     by_plane[field.plane_id] += field.payload_bytes
                 fit = min(
                     planes[plane_id] // size for plane_id, size in by_plane.items()
                 )
-                packing[declaration.spec.group_id] = 1 << (fit.bit_length() - 1)
+                packing[spec.group_id] = 1 << (fit.bit_length() - 1)
             return packing
         return self._power_of_two_packing(groups)
 

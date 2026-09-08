@@ -46,7 +46,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheMemoryPlan,
-    CachePlacement,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.qwen4_exp import (
     Qwen4ExpRecipe,
@@ -83,8 +82,6 @@ class CachePoolSpec:
     # from (CacheRecipe.groups), so the plan and the specs name one group set.
     cache_group_specs: tuple[CacheGroupSpec, ...]
     token_capacity: int
-    cache_group_placements: tuple[CachePlacement, ...] = ()
-    dcp_size: int = 1
     layer_kv_head_counts: tuple[int, ...] | None = None
     pool_options: object | None = None
 

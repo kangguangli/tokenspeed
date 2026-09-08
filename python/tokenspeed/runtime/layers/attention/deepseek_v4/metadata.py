@@ -95,12 +95,10 @@ class DeepseekV4IndexerBatchMetadata:
 
 @dataclass
 class DeepseekV4AttentionMetadata:
-    # C128 owner-filtered decode suffix, prepared once per forward/group. The
-    # metadata object owns its target/draft view and topology; keys carry the
-    # group and physical row geometry. Graph replay updates outputs in place.
-    dcp_dense_compressed: dict[
-        tuple[str, int, int], tuple[torch.Tensor, torch.Tensor]
-    ] = field(default_factory=dict)
+    # C128 local decode slots, prepared once per forward. CUDA graph replay
+    # updates these tensors in place; mixed decode slices share their storage.
+    dcp_c128_slots: torch.Tensor | None = None
+    dcp_c128_lens: torch.Tensor | None = None
     decode_swa_indices: torch.Tensor | None = None
     decode_swa_lens: torch.Tensor | None = None
     decode_dcp_zero_swa_lens: torch.Tensor | None = None

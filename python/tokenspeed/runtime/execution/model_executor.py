@@ -480,25 +480,11 @@ class ModelExecutor:
         )
 
         attn_backend.configure_runtime(
-            cache_runtime_contract=token_to_kv_pool.arena.runtime_contract,
             sliding_window_size=model_runner.sliding_window_size,
-            cache_group_specs=tuple(token_to_kv_pool.arena.cache_group_specs),
-            cache_group_page_counts=_cache_arena_attr(
-                token_to_kv_pool, "cache_group_page_counts", None
-            ),
         )
         if draft_attn_backend is not None:
             draft_attn_backend.configure_runtime(
-                cache_runtime_contract=_cache_arena_attr(
-                    draft_token_to_kv_pool, "runtime_contract", None
-                ),
                 sliding_window_size=model_runner.sliding_window_size,
-                cache_group_specs=tuple(
-                    _cache_arena_attr(draft_token_to_kv_pool, "cache_group_specs", ())
-                ),
-                cache_group_page_counts=_cache_arena_attr(
-                    draft_token_to_kv_pool, "cache_group_page_counts", None
-                ),
             )
 
         validate_cache_group_ids(

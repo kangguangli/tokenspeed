@@ -457,20 +457,32 @@ is safe before the L2 snapshot copies — is `scheduler.md` §2 and §4.
 
 ## Virtual block placement within a shared physical plan
 
-`CacheGroupDeclaration` declares the logical spec, local fields and placement
-together. Its two-value iteration is a physical projection for `pack`; it does
-not include process topology. The memory plan continues to own local shapes,
-strides, packing and byte counts. `CacheRuntimeContract.group_address_spaces`
-joins those facts to the declaration and the shared DCP degree.
+A recipe declares each group as a `(CacheGroupSpec, fields)` tuple.
+`CacheGroupSpec.shard_count` defaults to 1 (replicated); a larger value assigns
+virtual blocks cyclically across that many owners. The memory plan continues
+to own local shapes, strides, packing and byte counts. `CacheArena` is the sole
+publisher of `CacheRuntimeContract`, whose virtual counts and packing derive
+from these physical facts and each spec's `shard_count`. No separate placement
+or per-group address-space object is needed.
 
-For physical packing K, N usable parents and D placement buckets, a sharded
+Attention backends bind their compute view through `set_cache_pool()` and read
+`cache_pool.arena.runtime_contract`. Target and draft views share that arena;
+executor and graph setup do not inject another V4 contract or group geometry.
+The V4 backend checks its DCP topology against the group specs at binding.
+Per-forward metadata retains a reference to the same contract for translation.
+C128 decode prepares local slots and lengths once per forward in two tensor
+fields. Graph replay updates them in place, and mixed decode slices use views
+of those outputs rather than repeating selection in each layer.
+
+For physical packing K, N usable parents and D shards, a sharded
 group has `1 + N*K` local pages and `1 + N*D*K` virtual blocks. A replicated
 group uses one bucket. Existing `group_page_counts` and `group_packing` name
 physical quantities; the scheduler bridge explicitly consumes
 `virtual_block_counts` and `virtual_packing`. Virtual capacity must never be
 used to shape an arena field. Null ID 0 has no owner and forbids writes.
 
-The allocator receives only an integer `allocation_bucket_count`. It counts
+The allocator receives only an integer `shard_count`, fixed when the
+coordinator registers the group in its pools. It counts
 all nonnull refs in the request table, including shared prefixes and reserved
 headroom. Among available holes in already bound parents, it selects the
 least-loaded request bucket (ties by bucket ID), then the most occupied
@@ -494,12 +506,12 @@ directly without a second, pool-sized shadow planner. Insufficient capacity
 returns before changing the indices, occupancy, or FIFO. Ordinary, balanced,
 and Host allocation entry points use the same availability updates.
 
-With a stable bucket count, choosing a block examines the bucket-index heads,
-not every parent. Updating the chosen parent's ordering costs logarithmic time
-in the number of indexed parents per bucket. Advancing its free-slot cursor
-only searches that bucket within that parent. The first balanced call after
-ordinary allocations, or an explicit bucket-count change, rebuilds indices
-only for that group's partial parents; production group geometry stays fixed.
+Choosing a block examines the bucket-index heads, not every parent. Updating
+the chosen parent's ordering costs logarithmic time in the number of indexed
+parents per bucket. Advancing its free-slot cursor only searches that bucket
+within that parent. Ordinary and balanced calls share the registered geometry;
+changing the shard count or packing is rejected even after every block is
+released. No allocation call rebuilds the group's indices for new geometry.
 The additional metadata is per-parent bucket minima and at most one tree
 entry per available bucket of a partial parent. Request loads remain derived
 from `BlockTable` on each actual acquire; this optimization introduces no

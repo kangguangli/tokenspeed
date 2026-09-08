@@ -299,7 +299,7 @@ def declare_glm53_flash_groups(
             )
         )
     return tuple(
-        CacheGroupDeclaration(
+        (
             spec,
             fields + tuple(index_fields) if spec.group_id == FULL_ATTENTION else fields,
         )

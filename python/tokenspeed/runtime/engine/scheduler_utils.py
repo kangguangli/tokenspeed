@@ -244,9 +244,7 @@ def pool_to_cache_groups(pool: Any) -> list:
             retention=retention,
             family=family,
             cache_blocks_per_lcm_block=int(packing[spec.group_id]),
-            allocation_bucket_count=contract.group_address_spaces[
-                spec.group_id
-            ].allocation_bucket_count,
+            shard_count=spec.shard_count,
         )
         transfer_policy = spec.transfer_policy
         if transfer_policy is not None:

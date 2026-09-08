@@ -35,7 +35,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes import (
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
-    CacheGroupDeclaration,
     CacheLayout,
     pack,
 )
@@ -51,6 +50,9 @@ if TYPE_CHECKING:
         CacheModelFamily,
         CacheSetup,
     )
+
+
+CacheGroupDeclaration = tuple[CacheGroupSpec, tuple[CacheFieldSpec, ...]]
 
 
 class CacheRecipe(ABC):
@@ -121,8 +123,6 @@ class CacheRecipe(ABC):
                 # The same declarations the layout was packed from, so plan and
                 # specs cannot name different groups.
                 cache_group_specs=tuple(spec for spec, _ in groups),
-                cache_group_placements=tuple(group.placement for group in groups),
-                dcp_size=self.dcp_size,
                 token_capacity=self.token_capacity(layout, num_lcm_blocks),
                 layer_kv_head_counts=self.layer_kv_head_counts,
                 pool_options=self.pool_options(),
@@ -335,7 +335,7 @@ class CacheRecipe(ABC):
         )
         parents = 0
         for group_id, packing in layout.group_packing:
-            packing *= self._allocation_buckets[group_id]
+            packing *= self._shard_counts[group_id]
             child_pages = counts[group_id] - 1  # page 0 is the reserved null page
             parents += (child_pages + packing - 1) // packing
         return parents
@@ -368,27 +368,20 @@ class CacheRecipe(ABC):
 
     @cached_property
     def _group_specs(self) -> tuple[CacheGroupSpec, ...]:
-        return tuple(group.spec for group in self._group_declarations)
+        return tuple(spec for spec, _ in self._group_declarations)
 
     @cached_property
     def _group_declarations(self) -> tuple[CacheGroupDeclaration, ...]:
         return self.groups()
 
-    @property
-    def dcp_size(self) -> int:
-        return getattr(self.attn_config, "dcp_size", 1)
-
     @cached_property
-    def _allocation_buckets(self) -> dict[str, int]:
-        return {
-            group.spec.group_id: group.allocation_bucket_count(self.dcp_size)
-            for group in self._group_declarations
-        }
+    def _shard_counts(self) -> dict[str, int]:
+        return {spec.group_id: spec.shard_count for spec in self._group_specs}
 
     def _max_packing(self, layout: CacheLayout) -> int:
         """Virtual CacheBlocks per parent of the most finely packed group."""
         return max(
-            count * self._allocation_buckets[group_id]
+            count * self._shard_counts[group_id]
             for group_id, count in layout.group_packing
         )
 

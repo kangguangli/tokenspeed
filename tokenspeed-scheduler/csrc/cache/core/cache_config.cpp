@@ -44,8 +44,8 @@ void CacheGroupConfig::Validate() const {
     if (cache_blocks_per_lcm_block <= 0) {
         throw std::invalid_argument(where + "cache_blocks_per_lcm_block must be > 0");
     }
-    if (allocation_bucket_count <= 0 || cache_blocks_per_lcm_block % allocation_bucket_count != 0) {
-        throw std::invalid_argument(where + "allocation buckets must divide parent packing");
+    if (shard_count <= 0 || cache_blocks_per_lcm_block % shard_count != 0) {
+        throw std::invalid_argument(where + "shard_count must be positive and divide parent packing");
     }
     if (retention == Retention::SlidingWindow && (!sliding_window_tokens || *sliding_window_tokens <= 0)) {
         throw std::invalid_argument(where + "sliding_window_tokens must be > 0 for sliding groups");

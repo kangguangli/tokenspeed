@@ -42,7 +42,7 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
 from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
 from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
-    CacheGroupAddressSpace,
+    CacheRuntimeContract,
 )
 from tokenspeed.runtime.utils import get_colorful_logger
 
@@ -197,9 +197,7 @@ class DeepseekV4CacheMetadata:
     page_table: torch.Tensor
     dcp_size: int = 1
     dcp_rank: int = 0
-    group_address_spaces: Mapping[str, CacheGroupAddressSpace] = field(
-        default_factory=dict
-    )
+    runtime_contract: CacheRuntimeContract | None = None
     block_tables: dict[str, torch.Tensor] = field(default_factory=dict)
     # Per-sliding-group [num_reqs] int32 base logical-page offset that
     # accompanies each compact per-group table. Consumers index sliding tables as
@@ -248,16 +246,17 @@ class DeepseekV4CacheMetadata:
         """Return local compressed slots and the explicit payload/scale mask.
 
         DCP1 preserves its existing writer API. DCP>1 requires the declared
-        address space and maps nonowners to safe slot 0 with a false mask.
+        runtime contract and maps nonowners to safe slot 0 with a false mask.
         """
         if self.dcp_size == 1:
             return slots, None
-        space = self.group_address_spaces[v4_compressed_kv_group_id(compress_ratio)]
+        assert self.runtime_contract is not None
+        group_id = v4_compressed_kv_group_id(compress_ratio)
         return virtual_slots_to_local(
             slots,
             rows_per_page=v4_compressed_rows_per_page(compress_ratio),
-            virtual_block_count=space.virtual_block_count,
-            degree=space.allocation_bucket_count,
+            virtual_block_count=self.runtime_contract.virtual_block_counts[group_id],
+            degree=self.dcp_size,
             rank=self.dcp_rank,
         )
 

@@ -46,6 +46,7 @@ static_assert(!HasCacheIndex<BlockPool>);
 TEST(BlockPoolBucketTest, FreshAllocationsStayBalancedAtEveryLength) {
     for (std::int32_t buckets : {2, 4, 8}) {
         BlockPool pool(3);
+        pool.RegisterGroup(0, 2 * buckets, buckets);
         GroupAllocator allocator(2 * buckets, 0, buckets);
         BlockTable request;
         std::vector<std::int32_t> counts(static_cast<std::size_t>(buckets), 0);
@@ -62,6 +63,7 @@ TEST(BlockPoolBucketTest, FreshAllocationsStayBalancedAtEveryLength) {
 
 TEST(BlockPoolBucketTest, ChoosesBucketThenMostOccupiedParentAndLowestChild) {
     BlockPool pool(3);
+    pool.RegisterGroup(0, 8, 2);
     auto existing = pool.AcquireBlocks(0, 8, 16);
     existing[1].reset();
     existing[9].reset();
@@ -79,6 +81,7 @@ TEST(BlockPoolBucketTest, ChoosesBucketThenMostOccupiedParentAndLowestChild) {
 
 TEST(BlockPoolBucketTest, ExhaustsAvailableHolesEvenWhenAnotherBucketIsLighter) {
     BlockPool pool(2);
+    pool.RegisterGroup(0, 8, 2);
     auto existing = pool.AcquireBlocks(0, 8, 8);
     existing[4].reset();
     const std::vector<std::int32_t> loads{100, 0};
@@ -90,6 +93,7 @@ TEST(BlockPoolBucketTest, ExhaustsAvailableHolesEvenWhenAnotherBucketIsLighter) 
 
 TEST(BlockPoolBucketTest, CapacityFailureLeavesAllLocationsAndLoadsUntouched) {
     BlockPool pool(1);
+    pool.RegisterGroup(0, 8, 4);
     auto existing = pool.AcquireBlocks(0, 8, 5);
     const auto before = pool.OccupiedLocations(1);
     const std::vector<std::int32_t> loads{0, 2, 7, 0};
@@ -104,6 +108,7 @@ TEST(BlockPoolBucketTest, CapacityFailureLeavesAllLocationsAndLoadsUntouched) {
 
 TEST(BlockPoolBucketTest, CountsSharedPrefixAndHeadroomButSkipsNullReferences) {
     BlockPool pool(1);
+    pool.RegisterGroup(0, 8, 4);
     GroupAllocator allocator(8, 0, 4);
     BlockTable first;
     ASSERT_TRUE(allocator.Acquire(pool, first, AcquirePlan{.num_blocks = 3}));
@@ -321,6 +326,7 @@ TEST(BlockPoolTest, ExactAcquireBlocksRemainsAllOrNothing) {
 
 TEST(BlockPoolBucketTest, RetractionWithSharedPrefixRestoresHolesAndParentFifo) {
     BlockPool pool(3);
+    pool.RegisterGroup(0, 8, 4);
     GroupAllocator allocator(8, 0, 4);
     BlockTable request;
     ASSERT_TRUE(allocator.Acquire(pool, request, AcquirePlan{.num_blocks = 10}));
@@ -343,8 +349,9 @@ TEST(BlockPoolBucketTest, RetractionWithSharedPrefixRestoresHolesAndParentFifo) 
     EXPECT_EQ(rebound[2]->Location().lcm_block_id, 1);
 }
 
-TEST(BlockPoolBucketTest, BucketChangesCoverFullParentsAndLaterRebinding) {
+TEST(BlockPoolBucketTest, FixedShardsCoverFullParentsAndLaterRebinding) {
     BlockPool pool(2);
+    pool.RegisterGroup(7, 8, 4);
     auto full = pool.AcquireBlocks(7, 8, 8);
     const std::array<std::int32_t, 4> loads{0, 0, 0, 0};
     auto other = pool.AcquireBlocks(7, 8, 1, loads);
@@ -357,10 +364,12 @@ TEST(BlockPoolBucketTest, BucketChangesCoverFullParentsAndLaterRebinding) {
     hole.clear();
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), 2);
 
-    // The same group may use a different packing after all its parents unbind.
-    auto rebound = pool.AcquireBlocks(7, 2, 4);
-    EXPECT_EQ(rebound.size(), 4u);
-    EXPECT_TRUE(pool.AcquireBlocks(7, 2, 1, std::array<std::int32_t, 2>{0, 0}).empty());
+    pool.RegisterGroup(7, 8, 4);
+    EXPECT_THROW(pool.RegisterGroup(7, 8, 2), std::runtime_error);
+    EXPECT_THROW(pool.RegisterGroup(7, 2, 4), std::runtime_error);
+    auto rebound = pool.AcquireBlocks(7, 8, 16, loads);
+    EXPECT_EQ(rebound.size(), 16u);
+    EXPECT_TRUE(pool.AcquireBlocks(7, 8, 1, loads).empty());
 }
 
 // A deliberately exhaustive oracle: rank every compatible free slot from
@@ -477,6 +486,10 @@ TEST(BlockPoolBucketTest, InterleavedLifetimesMatchExhaustivePlacementOracle) {
         PlacementOracle oracle(24);
         std::vector<CacheBlockRef> held;
         const std::array<std::int32_t, 3> packing{8, 16, 1};
+        const std::array<std::int32_t, 3> shards{2, 8, 1};
+        for (std::uint32_t group = 0; group < packing.size(); ++group) {
+            pool.RegisterGroup(group, packing[group], shards[group]);
+        }
         for (int step = 0; step < 1200; ++step) {
             SCOPED_TRACE(step);
             const auto operation = random() % 10;
@@ -486,7 +499,7 @@ TEST(BlockPoolBucketTest, InterleavedLifetimesMatchExhaustivePlacementOracle) {
                 const bool partial = random() % 4 == 0;
                 std::vector<std::int32_t> loads;
                 if (!partial && group != 2 && random() % 4 != 0) {
-                    loads.resize(std::size_t{1} << (1 + random() % 3));
+                    loads.resize(static_cast<std::size_t>(shards[group]));
                     for (auto& load : loads) {
                         load = static_cast<std::int32_t>(random() % 31);
                     }

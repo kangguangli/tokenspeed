@@ -55,6 +55,22 @@ public:
     std::int32_t NumLcmBlocks() const noexcept { return static_cast<std::int32_t>(lcm_blocks_.size()); }
     std::int32_t NumEmptyLcmBlocks() const noexcept { return static_cast<std::int32_t>(free_parent_ids_.size()); }
 
+    // Fix placement geometry before this group allocates any blocks. Repeated
+    // registration is allowed only with the same geometry, including after free.
+    void RegisterGroup(std::uint32_t group_id, std::int32_t packing, std::int32_t shard_count = 1) {
+        _assert(packing > 0 && shard_count > 0 && packing % shard_count == 0,
+                "shard_count must be positive and divide parent packing");
+        auto [it, inserted] = group_availability_.try_emplace(group_id);
+        GroupAvailability& group = it->second;
+        if (inserted) {
+            group.packing = packing;
+            group.parents_by_bucket.resize(static_cast<std::size_t>(shard_count));
+        } else {
+            _assert(group.packing == packing && group.parents_by_bucket.size() == static_cast<std::size_t>(shard_count),
+                    "cache group geometry changed after registration");
+        }
+    }
+
     CacheBlockRef AcquireBlock(std::uint32_t group_id, std::int32_t cache_blocks_per_lcm_block) {
         std::vector<CacheBlockRef> blocks = AcquireBlocks(group_id, cache_blocks_per_lcm_block, 1);
         if (blocks.empty()) {
@@ -71,8 +87,9 @@ public:
         }
 
         if (bucket_loads.size() > 1) {
-            _assert(static_cast<std::size_t>(cache_blocks_per_lcm_block) % bucket_loads.size() == 0,
-                    "allocation buckets must divide parent packing");
+            const auto it = group_availability_.find(group_id);
+            _assert(it != group_availability_.end() && it->second.parents_by_bucket.size() == bucket_loads.size(),
+                    "allocation loads must match the registered shard_count");
             for (std::int32_t load : bucket_loads) {
                 _assert(load >= 0, "allocation bucket loads must be non-negative");
             }
@@ -178,19 +195,13 @@ public:
         ++group.free_slots;
         if (parent.occupied_count == 0) {
             group.free_slots -= parent.occupancy.size();
-            --group.bound_parents;
             parent.bound_group.reset();
             parent.occupancy.clear();
             parent.first_free_slots.clear();
             FatalCheck(free_parent_ids_.size() < lcm_blocks_.size(), "LCM free queue overflow");
             free_parent_ids_.push_back(location.lcm_block_id);
         } else {
-            // A full parent has no index entries, so a bucket-count change
-            // may have left its (all-empty) minima at the old width.
             const std::size_t buckets = group.parents_by_bucket.size();
-            if (parent.first_free_slots.size() != buckets) {
-                parent.first_free_slots.assign(buckets, group.packing);
-            }
             auto& first = parent.first_free_slots[slot % buckets];
             first = std::min(first, location.slot_index);
             addAvailability(group, parent, location.lcm_block_id);
@@ -202,7 +213,6 @@ private:
     struct GroupAvailability {
         std::int32_t packing{0};
         std::size_t free_slots{0};  // Holes in bound parents; empty parents remain pool-wide.
-        std::size_t bound_parents{0};
         std::vector<std::set<ParentOrder>> parents_by_bucket;
     };
     struct LcmBlock {
@@ -217,8 +227,7 @@ private:
     std::size_t availableBlocks(std::uint32_t group_id, std::int32_t packing) const {
         const auto it = group_availability_.find(group_id);
         if (it != group_availability_.end()) {
-            _assert(it->second.bound_parents == 0 || it->second.packing == packing,
-                    "group packing changed while LCM block is occupied");
+            _assert(it->second.packing == packing, "cache group packing changed after registration");
         }
         const std::size_t holes = it == group_availability_.end() ? 0 : it->second.free_slots;
         return holes + free_parent_ids_.size() * static_cast<std::size_t>(packing);
@@ -246,43 +255,12 @@ private:
         }
     }
 
-    GroupAvailability& prepareAvailability(std::uint32_t group_id, std::int32_t packing,
-                                           std::size_t requested_buckets = 0) {
-        (void)availableBlocks(group_id, packing);  // Validate a live group's packing before mutation.
-        auto [it, inserted] = group_availability_.try_emplace(group_id);
-        GroupAvailability& group = it->second;
-        if (inserted || (group.bound_parents == 0 && group.packing != packing)) {
-            group = GroupAvailability{.packing = packing};
-            group.parents_by_bucket.resize(requested_buckets > 0 ? requested_buckets : 1);
+    GroupAvailability& prepareAvailability(std::uint32_t group_id, std::int32_t packing) {
+        (void)availableBlocks(group_id, packing);
+        if (!group_availability_.contains(group_id)) {
+            RegisterGroup(group_id, packing);
         }
-        if (requested_buckets == 0 || requested_buckets == group.parents_by_bucket.size()) {
-            return group;
-        }
-        // Mixed ordinary/balanced callers are allowed. Configure on the first
-        // balanced acquire (or an explicit change), visiting only partial
-        // parents of this group. Steady-state allocation never rebuilds this.
-        std::vector<std::int32_t> partial_parents;
-        for (const auto& bucket : group.parents_by_bucket) {
-            for (const auto& [occupied, id] : bucket) {
-                partial_parents.push_back(id);
-            }
-        }
-        std::ranges::sort(partial_parents);
-        partial_parents.erase(std::unique(partial_parents.begin(), partial_parents.end()), partial_parents.end());
-        group.parents_by_bucket.clear();
-        group.parents_by_bucket.resize(requested_buckets);
-        for (std::int32_t id : partial_parents) {
-            LcmBlock& parent = lcm_blocks_[static_cast<std::size_t>(id - 1)];
-            parent.first_free_slots.assign(requested_buckets, packing);
-            for (std::size_t slot = 0; slot < parent.occupancy.size(); ++slot) {
-                if (!parent.occupancy[slot]) {
-                    auto& first = parent.first_free_slots[slot % requested_buckets];
-                    first = std::min(first, static_cast<std::int32_t>(slot));
-                }
-            }
-            addAvailability(group, parent, id);
-        }
-        return group;
+        return group_availability_.at(group_id);
     }
 
     CacheBlockLocation nextLocation(const GroupAvailability& group, std::span<const std::int64_t> loads) const {
@@ -316,7 +294,7 @@ private:
     std::vector<CacheBlockRef> acquireAvailableBlocks(std::uint32_t group_id, std::int32_t packing, std::int32_t count,
                                                       std::span<const std::int32_t> bucket_loads = {}) {
         const bool balanced = bucket_loads.size() > 1;
-        GroupAvailability& group = prepareAvailability(group_id, packing, balanced ? bucket_loads.size() : 0);
+        GroupAvailability& group = prepareAvailability(group_id, packing);
         std::vector<std::int64_t> loads;
         if (balanced) {
             loads.assign(bucket_loads.begin(), bucket_loads.end());
@@ -373,7 +351,6 @@ private:
             }
             free_parent_ids_.pop_front();
             parent.bound_group = group_id;
-            ++group.bound_parents;
             group.free_slots += static_cast<std::size_t>(slots_per_parent);
         } else {
             removeAvailability(group, parent, location.lcm_block_id);

@@ -128,7 +128,7 @@ class InklingRecipe(CacheRecipe):
     def groups(self) -> tuple[CacheGroupDeclaration, ...]:
         """The attention groups from the layer walk, plus both conv columns."""
         conv = tuple(
-            CacheGroupDeclaration(
+            (
                 CacheGroupSpec(
                     group_id=group_id,
                     retention="full_history",
@@ -144,8 +144,7 @@ class InklingRecipe(CacheRecipe):
             # The layer walk already stamped the attention groups.
             policies = apply_pd_transfer_policies(tuple(spec for spec, _ in conv))
             conv = tuple(
-                CacheGroupDeclaration(spec, fields)
-                for spec, (_, fields) in zip(policies, conv, strict=True)
+                (spec, fields) for spec, (_, fields) in zip(policies, conv, strict=True)
             )
         return super().groups() + conv
 

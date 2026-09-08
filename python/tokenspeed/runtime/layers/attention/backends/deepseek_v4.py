@@ -300,7 +300,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self._expected_cache_group_ids: tuple[str, ...] | None = None
         self._cache_group_raw_tokens_per_page: dict[str, int] = {}
         self._cache_group_max_page_ids: dict[str, int] = {}
-        self._cache_runtime_contract = None
         self.dcp_size = getattr(config, "dcp_size", 1)
         self.dcp_rank = getattr(config, "dcp_rank", 0)
         self.dcp_group = getattr(config, "dcp_group", ())
@@ -341,100 +340,47 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             self.step_counter.record_cache()
         return hidden_states
 
-    def _configure_cache_group_contract(
-        self,
-        cache_group_specs=(),
-        cache_group_page_counts=None,
-    ) -> tuple[tuple[object, ...], dict[str, int]]:
-        specs = tuple(cache_group_specs or ())
-        group_ids = tuple(getattr(spec, "group_id", None) for spec in specs)
-        if any(not isinstance(group_id, str) or not group_id for group_id in group_ids):
-            raise RuntimeError(
-                "DeepSeek V4 cache group specs must use nonempty string IDs"
+    def set_cache_pool(self, cache_pool) -> None:
+        """Bind the compute view and learn geometry from its arena contract."""
+        contract = cache_pool.arena.runtime_contract
+        for spec in contract.group_specs:
+            expected_shards = (
+                self.dcp_size
+                if spec.group_id
+                in (
+                    v4_compressed_kv_group_id(4),
+                    v4_compressed_kv_group_id(128),
+                )
+                else 1
             )
-        if len(group_ids) != len(set(group_ids)):
-            raise RuntimeError("DeepSeek V4 cache group specs contain duplicate IDs")
-        page_counts = dict(cache_group_page_counts or {})
-        if self._cache_runtime_contract is not None:
-            # Incoming tables contain virtual IDs; physical page counts are
-            # reserved for arena binding and kernel slots.
-            page_counts = dict(self._cache_runtime_contract.virtual_block_counts)
-        if not group_ids:
-            if page_counts:
-                raise RuntimeError(
-                    "DeepSeek V4 cache page counts require matching group specs"
-                )
-            raw_tokens_per_page: dict[str, int] = {}
-            max_page_ids: dict[str, int] = {}
-        else:
-            if set(page_counts) != set(group_ids):
-                raise RuntimeError(
-                    "DeepSeek V4 cache page counts disagree with group specs: "
-                    f"missing={sorted(set(group_ids) - set(page_counts))} "
-                    f"extra={sorted(set(page_counts) - set(group_ids))}"
-                )
-            invalid_counts = {
-                group_id: page_counts[group_id]
-                for group_id in group_ids
-                if not isinstance(page_counts[group_id], int)
-                or isinstance(page_counts[group_id], bool)
-                or page_counts[group_id] <= 1
-            }
-            if invalid_counts:
-                raise RuntimeError(
-                    "DeepSeek V4 cache groups must reserve page 0 and at least one "
-                    f"live page: {invalid_counts!r}"
-                )
-            raw_tokens_per_page = {}
-            for spec, group_id in zip(specs, group_ids, strict=True):
-                raw_tokens = int(spec.rows_per_page) * int(spec.entry_stride_tokens)
-                if raw_tokens <= 0:
-                    raise RuntimeError(
-                        "DeepSeek V4 cache group has invalid page geometry: "
-                        f"group={group_id!r} rows_per_page={spec.rows_per_page} "
-                        f"entry_stride_tokens={spec.entry_stride_tokens}"
-                    )
-                raw_tokens_per_page[group_id] = raw_tokens
-            max_page_ids = {
-                group_id: int(page_counts[group_id]) - 1 for group_id in group_ids
-            }
-
-        if self._expected_cache_group_ids is not None:
-            if (
-                self._expected_cache_group_ids != group_ids
-                or self._cache_group_raw_tokens_per_page != raw_tokens_per_page
-                or self._cache_group_max_page_ids != max_page_ids
-            ):
-                raise RuntimeError(
-                    "DeepSeek V4 cache group contract changed after initialization"
-                )
-        self._expected_cache_group_ids = group_ids
-        self._cache_group_raw_tokens_per_page = raw_tokens_per_page
-        self._cache_group_max_page_ids = max_page_ids
-        return specs, page_counts
-
-    def configure_runtime(self, **kwargs) -> None:
-        contract = kwargs.pop("cache_runtime_contract", None)
-        if contract is not None:
-            if contract.dcp_size != self.dcp_size:
+            if spec.shard_count != expected_shards:
                 raise ValueError(
                     "DeepSeek V4 attention and cache DCP topologies disagree"
                 )
-            self._cache_runtime_contract = contract
-        self._configure_cache_group_contract(
-            kwargs.pop("cache_group_specs", ()),
-            kwargs.pop("cache_group_page_counts", None),
+        if (
+            self.cache_pool is not None
+            and self.cache_pool.arena is not cache_pool.arena
+        ):
+            raise RuntimeError(
+                "DeepSeek V4 cache group contract changed after initialization"
+            )
+        super().set_cache_pool(cache_pool)
+        self._expected_cache_group_ids = tuple(
+            spec.group_id for spec in contract.group_specs
         )
+        self._cache_group_raw_tokens_per_page = {
+            spec.group_id: spec.page_size for spec in contract.group_specs
+        }
+        self._cache_group_max_page_ids = {
+            group_id: count - 1
+            for group_id, count in contract.virtual_block_counts.items()
+        }
 
-    def _cache_placement_kwargs(self) -> dict:
+    def _cache_metadata_kwargs(self) -> dict:
         return {
             "dcp_size": self.dcp_size,
             "dcp_rank": self.dcp_rank,
-            "group_address_spaces": (
-                self._cache_runtime_contract.group_address_spaces
-                if self._cache_runtime_contract is not None
-                else {}
-            ),
+            "runtime_contract": self.cache_pool.arena.runtime_contract,
         }
 
     def _prepare_cache_group_tables(
@@ -835,7 +781,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             if is_cuda_graph_metadata:
                 self._cuda_graph_draft_decode_metadata[bs] = metadata
             self._draft_decode_metadata = metadata
-            self._refresh_dcp_dense_compressed_metadata(metadata)
+            self._refresh_dcp_c128_metadata(metadata)
             if self._decode_swa_window_size > 0 and self._decode_swa_block_size > 0:
                 self._update_decode_swa_metadata(
                     metadata,
@@ -881,7 +827,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             max_context_len=self.context_len,
         )
         _refresh_decode_indexer_schedule_metadata(metadata)
-        self._refresh_dcp_dense_compressed_metadata(metadata)
+        self._refresh_dcp_c128_metadata(metadata)
         self._draft_decode_metadata = metadata
 
     def _select_decode_metadata(
@@ -1155,7 +1101,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             (1, 0),
         )
         cache_metadata = DeepseekV4CacheMetadata(
-            **self._cache_placement_kwargs(),
+            **self._cache_metadata_kwargs(),
             page_size=self.kernel_page_size,
             page_table=page_table,
             block_tables=block_tables,
@@ -1180,7 +1126,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             num_prefill_tokens=num_prefill_tokens,
             forward_mode=metadata_forward_mode,
         )
-        self._refresh_dcp_dense_compressed_metadata(self.forward_metadata)
+        self._refresh_dcp_c128_metadata(self.forward_metadata)
         if is_packed_decode:
             self.forward_decode_metadata = self.forward_metadata
             if getattr(self, "is_draft", False):
@@ -1305,15 +1251,14 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 metadata = self.forward_metadata
                 if metadata is None:
                     raise RuntimeError("DeepSeek V4 DCP requires forward metadata")
-                key = (
-                    v4_compressed_kv_group_id(compress_ratio),
-                    block_size,
-                    positions.numel(),
-                )
-                cached = metadata.attention.dcp_dense_compressed.get(key)
-                if cached is None or cached[0].shape[0] != positions.numel():
+                indices = metadata.attention.dcp_c128_slots
+                lens = metadata.attention.dcp_c128_lens
+                if (
+                    indices is None
+                    or lens is None
+                    or indices.shape[0] != positions.numel()
+                ):
                     raise RuntimeError("C128 DCP decode metadata was not prepared")
-                indices, lens = cached
                 return indices.unsqueeze(1), lens
             indices, lens, _ = self._dcp_selected_compressed_rows(
                 positions,
@@ -1471,9 +1416,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             compressed_table_capacity=compressed_table_capacity,
         )
 
-    def _refresh_dcp_dense_compressed_metadata(
-        self, metadata: DeepseekV4ForwardMetadata
-    ) -> None:
+    def _refresh_dcp_c128_metadata(self, metadata: DeepseekV4ForwardMetadata) -> None:
         """Prepare C128 local slots once for this forward's decode queries.
 
         Eager calls own fresh outputs. Graph metadata retains only the output
@@ -1504,9 +1447,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             )
             // 128
         )
-        space = metadata.cache.group_address_spaces[group_id]
-        key = (group_id, rows, count)
-        cached = metadata.attention.dcp_dense_compressed.get(key)
+        contract = metadata.cache.runtime_contract
+        assert contract is not None
         with torch.inference_mode(False):
             candidates = (
                 torch.arange(width, device=positions.device, dtype=torch.int32)
@@ -1520,8 +1462,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 block_table=metadata.cache.compressed_page_table(128),
                 rows_per_page=rows,
                 compress_ratio=128,
-                virtual_block_count=space.virtual_block_count,
-                degree=space.allocation_bucket_count,
+                virtual_block_count=contract.virtual_block_counts[group_id],
+                degree=self.dcp_size,
                 rank=self.dcp_rank,
                 block_table_base_offsets=_compressed_block_table_base_offsets(
                     metadata, 128
@@ -1531,11 +1473,12 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                     if metadata.is_valid_token is not None
                     else None
                 ),
-                out_slots=cached[0] if cached is not None else None,
-                out_lens=cached[1] if cached is not None else None,
+                out_slots=metadata.attention.dcp_c128_slots,
+                out_lens=metadata.attention.dcp_c128_lens,
                 return_global_valid=False,
             )
-        metadata.attention.dcp_dense_compressed[key] = (slots, lens)
+        metadata.attention.dcp_c128_slots = slots
+        metadata.attention.dcp_c128_lens = lens
 
     def _dcp_selected_compressed_rows(
         self,
@@ -1558,7 +1501,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             candidates = torch.arange(width, device=positions.device, dtype=torch.int32)
             candidates = candidates.unsqueeze(0).expand(positions.numel(), -1)
         group_id = v4_compressed_kv_group_id(compress_ratio)
-        space = metadata.cache.group_address_spaces[group_id]
+        contract = metadata.cache.runtime_contract
+        assert contract is not None
         return dsv4_dcp_selected_slots(
             candidates,
             positions=positions,
@@ -1566,8 +1510,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             block_table=metadata.cache.compressed_page_table(compress_ratio),
             rows_per_page=block_size,
             compress_ratio=compress_ratio,
-            virtual_block_count=space.virtual_block_count,
-            degree=space.allocation_bucket_count,
+            virtual_block_count=contract.virtual_block_counts[group_id],
+            degree=self.dcp_size,
             rank=self.dcp_rank,
             block_table_base_offsets=_compressed_block_table_base_offsets(
                 metadata, compress_ratio
@@ -2180,7 +2124,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         sliced_cache = DeepseekV4CacheMetadata(
             dcp_size=cache_metadata.dcp_size,
             dcp_rank=cache_metadata.dcp_rank,
-            group_address_spaces=cache_metadata.group_address_spaces,
+            runtime_contract=cache_metadata.runtime_contract,
             page_size=cache_metadata.page_size,
             page_table=cache_metadata.page_table[req_start:req_end],
             block_tables=block_tables,
@@ -2239,13 +2183,13 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             end = token_end - metadata.num_prefill_tokens
             if start < 0:
                 raise RuntimeError("Decode metadata slice overlaps prefill queries")
-            sliced.attention.dcp_dense_compressed = {
-                (group_id, rows, token_count): (slots[start:end], lens[start:end])
-                for (group_id, rows, count), (slots, lens) in (
-                    metadata.attention.dcp_dense_compressed.items()
-                )
-                if count == metadata.decode_token_count()
-            }
+            if metadata.attention.dcp_c128_slots is not None:
+                sliced.attention.dcp_c128_slots = metadata.attention.dcp_c128_slots[
+                    start:end
+                ]
+                sliced.attention.dcp_c128_lens = metadata.attention.dcp_c128_lens[
+                    start:end
+                ]
             metadata.decode_slices[slice_key] = sliced
         return sliced
 
@@ -2420,8 +2364,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
     def init_cuda_graph_state(
         self,
         max_bs: int,
-        cache_group_specs=(),
-        cache_group_page_counts=None,
         max_tokens_per_req: int = 1,
         overlap_schedule_depth: int = 0,
     ):
@@ -2483,22 +2425,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             )
         self._cuda_graph_max_bs = max_bs
         self._cuda_graph_block_tables = {}
-        specs, _ = self._configure_cache_group_contract(
-            cache_group_specs,
-            cache_group_page_counts,
-        )
-        group_ids = self._expected_cache_group_ids
-        assert group_ids is not None
-        if not group_ids:
-            self._cuda_graph_block_table_base_offsets = {}
-            self._cuda_graph_is_valid_token = torch.ones(
-                max_tokens,
-                dtype=torch.bool,
-                device=self.device,
-            )
-            return
         self._cuda_graph_block_table_base_offsets = {}
-        for spec, gid in zip(specs, group_ids, strict=True):
+        for spec in self.cache_pool.arena.runtime_contract.group_specs:
+            gid = spec.group_id
             sliding = str(getattr(spec, "retention", "")) == "sliding_window"
             max_pages = self._cuda_graph_group_table_width(
                 spec,
@@ -2716,7 +2645,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             else {}
         )
         cache_metadata = DeepseekV4CacheMetadata(
-            **self._cache_placement_kwargs(),
+            **self._cache_metadata_kwargs(),
             page_size=self.kernel_page_size,
             page_table=self._cuda_graph_page_table[:bs, : self.max_num_pages],
             block_tables=metadata_block_tables,
@@ -2756,7 +2685,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             metadata.forward_mode = metadata_forward_mode
         self._cuda_graph_metadata[bs] = metadata
         metadata.decode_slices.clear()
-        self._refresh_dcp_dense_compressed_metadata(metadata)
+        self._refresh_dcp_c128_metadata(metadata)
         if is_packed_decode and getattr(self, "is_draft", False):
             self._prepare_draft_decode_metadata(
                 metadata,
@@ -2905,7 +2834,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         metadata.token_to_req_indices = self._cuda_graph_token_to_req[:total_tokens]
         metadata.is_valid_token = self._cuda_graph_is_valid_token[:total_tokens]
         metadata.cache = DeepseekV4CacheMetadata(
-            **self._cache_placement_kwargs(),
+            **self._cache_metadata_kwargs(),
             page_size=self.kernel_page_size,
             page_table=self._cuda_graph_page_table[:bs, : self.max_num_pages],
             block_tables=metadata_block_tables,
@@ -2923,7 +2852,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         metadata.num_prefill_reqs = 0
         metadata.num_prefill_tokens = 0
         metadata.decode_slices.clear()
-        self._refresh_dcp_dense_compressed_metadata(metadata)
+        self._refresh_dcp_c128_metadata(metadata)
         if is_packed_decode and getattr(self, "is_draft", False):
             self._prepare_draft_decode_metadata(
                 metadata,
@@ -2990,7 +2919,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             max_context_len=self.context_len,
         )
         _refresh_decode_indexer_schedule_metadata(metadata)
-        self._refresh_dcp_dense_compressed_metadata(metadata)
+        self._refresh_dcp_c128_metadata(metadata)
         self.forward_decode_metadata = metadata
         self.forward_metadata = metadata
 

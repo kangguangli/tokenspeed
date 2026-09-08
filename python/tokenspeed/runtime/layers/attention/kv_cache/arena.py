@@ -29,10 +29,10 @@ from tokenspeed_kernel.ops.kvcache.triton import zero_byte_ranges
 
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     CacheRuntimeContract,
+    local_block,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheMemoryPlan,
-    CachePlacement,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupSpec,
@@ -63,8 +63,6 @@ class CacheArena:
         device: str,
         *,
         cache_group_specs: tuple[CacheGroupSpec, ...],
-        cache_group_placements: tuple[CachePlacement, ...] = (),
-        dcp_size: int = 1,
         dcp_rank: int = 0,
         token_capacity: int | None = None,
         enable_memory_saver: bool = False,
@@ -75,7 +73,10 @@ class CacheArena:
             )
         self.plan = plan
         self.device = device
-        if not 0 <= dcp_rank < dcp_size:
+        if dcp_rank < 0 or any(
+            spec.shard_count > 1 and dcp_rank >= spec.shard_count
+            for spec in cache_group_specs
+        ):
             raise ValueError("cache arena DCP rank is out of range")
         self.dcp_rank = dcp_rank
         self._cache_group_specs_by_id = {
@@ -117,18 +118,6 @@ class CacheArena:
                 token_capacity if token_capacity is not None else self.size
             ),
             group_specs=tuple(cache_group_specs),
-            group_placements=(
-                dict(
-                    zip(
-                        (spec.group_id for spec in cache_group_specs),
-                        cache_group_placements,
-                        strict=True,
-                    )
-                )
-                if cache_group_placements
-                else {}
-            ),
-            dcp_size=dcp_size,
             group_page_counts={
                 spec.group_id: plan_groups[spec.group_id].page_count
                 for spec in cache_group_specs
@@ -245,12 +234,20 @@ class CacheArena:
     def zero_blocks(self, block_ids_by_group: dict[str, list[int]]) -> None:
         """Clear this rank's owned scheduler blocks, preserving null page 0."""
         local_ids = {}
+        counts = self.runtime_contract.virtual_block_counts
         for group_id, block_ids in block_ids_by_group.items():
-            space = self.runtime_contract.group_address_spaces[group_id]
+            spec = self._cache_group_specs_by_id[group_id]
             local_ids[group_id] = [
                 local
                 for block in block_ids
-                for local, owned in (space.local_block(block, self.dcp_rank),)
+                for local, owned in (
+                    local_block(
+                        block,
+                        shard_count=spec.shard_count,
+                        rank=self.dcp_rank,
+                        virtual_block_count=counts[group_id],
+                    ),
+                )
                 if owned
             ]
         segments = [

@@ -203,7 +203,7 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
         ple_fields = self._ple_fields()
         if ple_fields:
             extras += (
-                CacheGroupDeclaration(
+                (
                     CacheGroupSpec(
                         group_id=QWEN4_EXP_PLE_CACHE_GROUP,
                         retention="full_history",
@@ -217,7 +217,7 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
         qsa_compressed_fields, qsa_recent_fields = self._qsa_fields()
         if qsa_compressed_fields:
             extras += (
-                CacheGroupDeclaration(
+                (
                     CacheGroupSpec(
                         group_id=QWEN4_EXP_QSA_CACHE_GROUP,
                         retention="full_history",
@@ -228,7 +228,7 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
                     ),
                     qsa_compressed_fields,
                 ),
-                CacheGroupDeclaration(
+                (
                     CacheGroupSpec(
                         group_id=QWEN4_EXP_QSA_RECENT_CACHE_GROUP,
                         retention="sliding_window",
@@ -243,7 +243,7 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
         if self.pd_disaggregation_enabled and extras:
             policies = apply_pd_transfer_policies(tuple(spec for spec, _ in extras))
             extras = tuple(
-                CacheGroupDeclaration(spec, fields)
+                (spec, fields)
                 for spec, (_, fields) in zip(policies, extras, strict=True)
             )
         return super().groups() + extras

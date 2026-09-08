@@ -46,13 +46,11 @@ namespace tokenspeed {
 class GroupAllocator {
 public:
     explicit GroupAllocator(std::int32_t cache_blocks_per_lcm_block = 1, std::uint32_t group_id = 0,
-                            std::int32_t allocation_bucket_count = 1)
-        : cache_blocks_per_lcm_block_{cache_blocks_per_lcm_block},
-          group_id_{group_id},
-          allocation_bucket_count_{allocation_bucket_count} {
+                            std::int32_t shard_count = 1)
+        : cache_blocks_per_lcm_block_{cache_blocks_per_lcm_block}, group_id_{group_id}, shard_count_{shard_count} {
         _assert(cache_blocks_per_lcm_block > 0, "cache_blocks_per_lcm_block must be > 0");
-        _assert(allocation_bucket_count > 0 && cache_blocks_per_lcm_block % allocation_bucket_count == 0,
-                "allocation buckets must divide parent packing");
+        _assert(shard_count > 0 && cache_blocks_per_lcm_block % shard_count == 0,
+                "shard_count must be positive and divide parent packing");
     }
 
     GroupAllocator(const GroupAllocator&) = delete;
@@ -217,15 +215,15 @@ public:
 
 private:
     std::vector<std::int32_t> BucketLoads(const BlockTable& table) const {
-        if (allocation_bucket_count_ == 1) {
+        if (shard_count_ == 1) {
             return {};
         }
-        std::vector<std::int32_t> loads(static_cast<std::size_t>(allocation_bucket_count_), 0);
+        std::vector<std::int32_t> loads(static_cast<std::size_t>(shard_count_), 0);
         // Shared prefix refs and allocated headroom both count. Null slots in
         // sparse tables do not own a placement and contribute nothing.
         for (const CacheBlockRef& ref : table.Blocks()) {
             if (ref) {
-                ++loads[static_cast<std::size_t>(ref->Location().slot_index % allocation_bucket_count_)];
+                ++loads[static_cast<std::size_t>(ref->Location().slot_index % shard_count_)];
             }
         }
         return loads;
@@ -233,7 +231,7 @@ private:
 
     std::int32_t cache_blocks_per_lcm_block_;
     std::uint32_t group_id_;
-    std::int32_t allocation_bucket_count_;
+    std::int32_t shard_count_;
 };
 
 }  // namespace tokenspeed
