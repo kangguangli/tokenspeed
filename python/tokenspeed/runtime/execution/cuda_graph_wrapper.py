@@ -240,6 +240,7 @@ class CudaGraphWrapper:
             attn_backend,
             self.max_bs,
             cache_group_specs=tuple(token_to_kv_pool.arena.cache_group_specs),
+            cache_group_page_counts=(token_to_kv_pool.arena.cache_group_page_counts),
             max_tokens_per_req=self.max_tokens_per_req,
             overlap_schedule_depth=self.overlap_schedule_depth,
         )
@@ -248,6 +249,9 @@ class CudaGraphWrapper:
                 draft_attn_backend,
                 self.max_bs,
                 cache_group_specs=tuple(draft_token_to_kv_pool.arena.cache_group_specs),
+                cache_group_page_counts=(
+                    draft_token_to_kv_pool.arena.cache_group_page_counts
+                ),
                 max_tokens_per_req=self.max_tokens_per_req,
                 overlap_schedule_depth=self.overlap_schedule_depth,
             )

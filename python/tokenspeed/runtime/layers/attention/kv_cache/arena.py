@@ -29,11 +29,8 @@ from tokenspeed_kernel.ops.kvcache.triton import zero_byte_ranges
 
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     CacheRuntimeContract,
-    local_block,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
-    CacheMemoryPlan,
-)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import CacheMemoryPlan
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupSpec,
 )
@@ -63,7 +60,6 @@ class CacheArena:
         device: str,
         *,
         cache_group_specs: tuple[CacheGroupSpec, ...],
-        dcp_rank: int = 0,
         token_capacity: int | None = None,
         enable_memory_saver: bool = False,
     ):
@@ -73,12 +69,6 @@ class CacheArena:
             )
         self.plan = plan
         self.device = device
-        if dcp_rank < 0 or any(
-            spec.shard_count > 1 and dcp_rank >= spec.shard_count
-            for spec in cache_group_specs
-        ):
-            raise ValueError("cache arena DCP rank is out of range")
-        self.dcp_rank = dcp_rank
         self._cache_group_specs_by_id = {
             spec.group_id: spec for spec in cache_group_specs
         }
@@ -232,27 +222,25 @@ class CacheArena:
         return self.plan.field_page_byte_offset(field_id, block_id)
 
     def zero_blocks(self, block_ids_by_group: dict[str, list[int]]) -> None:
-        """Clear this rank's owned scheduler blocks, preserving null page 0."""
-        local_ids = {}
-        counts = self.runtime_contract.virtual_block_counts
+        """Clear local physical blocks after validating every group's IDs.
+
+        Args:
+            block_ids_by_group: Local block IDs, each in [0, group.page_count).
+
+        Raises:
+            IndexError: A block ID is outside its group's physical range.
+        """
         for group_id, block_ids in block_ids_by_group.items():
-            spec = self._cache_group_specs_by_id[group_id]
-            local_ids[group_id] = [
-                local
-                for block in block_ids
-                for local, owned in (
-                    local_block(
-                        block,
-                        shard_count=spec.shard_count,
-                        rank=self.dcp_rank,
-                        virtual_block_count=counts[group_id],
-                    ),
-                )
-                if owned
-            ]
+            page_count = self.plan.group(group_id).page_count
+            for block in block_ids:
+                if not 0 <= block < page_count:
+                    raise IndexError(
+                        f"local block ID {block} outside [0, {page_count}) "
+                        f"for group {group_id!r}"
+                    )
         segments = [
             segment
-            for group_id, block_ids in local_ids.items()
+            for group_id, block_ids in block_ids_by_group.items()
             for segment in self.block_byte_segments(group_id, block_ids)
         ]
         if segments:

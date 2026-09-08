@@ -44,9 +44,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.kimi_k3 import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
     OrdinaryRecipe,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
-    CacheMemoryPlan,
-)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import CacheMemoryPlan
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.qwen4_exp import (
     Qwen4ExpRecipe,
 )

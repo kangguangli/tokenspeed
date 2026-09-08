@@ -68,8 +68,7 @@ class CacheGroupSpec:
 
     def __post_init__(self) -> None:
         if (
-            isinstance(self.shard_count, bool)
-            or not isinstance(self.shard_count, int)
+            not isinstance(self.shard_count, int)
             or self.shard_count <= 0
         ):
             raise ValueError("shard_count must be a positive integer")
@@ -559,7 +558,7 @@ def group(
     fields_for_layer,
     page_sizes: Mapping[str, int] | None = None,
     pd_disaggregation_enabled: bool = False,
-) -> tuple[tuple[CacheGroupSpec, tuple[plan.CacheFieldSpec, ...]], ...]:
+) -> tuple[tuple[CacheGroupSpec, tuple], ...]:
     """Walk the layers once, building each group whole.
 
     A cache group has two halves -- the scheduler-facing spec and the bytes

@@ -21,9 +21,12 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
+
+import torch
+from tokenspeed_kernel.ops.kvcache.triton_virtual_blocks import virtual_slots_to_local
 
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupSpec,
@@ -53,30 +56,43 @@ def require_positive_int(name: str, value: object) -> int:
     return value
 
 
-def local_block(
-    virtual_block: int, *, shard_count: int, rank: int, virtual_block_count: int
-) -> tuple[int, bool]:
-    """Translate a scheduler block to a local page and ownership mask.
+def local_blocks(
+    virtual_blocks: Sequence[int],
+    *,
+    shard_count: int,
+    rank: int,
+    virtual_block_count: int,
+) -> list[int]:
+    """Translate a batch of scheduler blocks to owned local pages on the CPU.
 
     Args:
-        virtual_block: Scheduler block ID, including reserved null ID 0.
+        virtual_blocks: Scheduler block IDs, including reserved null ID 0.
         shard_count: Cyclic owner count from the group's spec; 1 is replicated.
         rank: This process's rank in the DCP subgroup.
         virtual_block_count: Exclusive bound from the arena's runtime contract.
 
     Returns:
-        ``(local_page, owned)``; null and remote blocks return ``(0, False)``.
+        Owned local page IDs in input order, preserving duplicates and
+        excluding null and remote blocks.
+
+    Raises:
+        IndexError: If any virtual block ID is outside the contract's bounds.
+        ValueError: If the shard count or rank is invalid.
     """
     require_positive_int("shard_count", shard_count)
     if rank < 0 or (shard_count > 1 and rank >= shard_count):
         raise ValueError("DCP rank is out of range")
-    if not 0 <= virtual_block < virtual_block_count:
+    blocks = torch.tensor(virtual_blocks, dtype=torch.int64, device="cpu")
+    if ((blocks < 0) | (blocks >= virtual_block_count)).any():
         raise IndexError("virtual cache block ID is out of range")
-    if virtual_block == 0 or (
-        shard_count > 1 and (virtual_block - 1) % shard_count != rank
-    ):
-        return 0, False
-    return (virtual_block - 1) // shard_count + 1, True
+    local, owned = virtual_slots_to_local(
+        blocks,
+        rows_per_page=1,
+        virtual_block_count=virtual_block_count,
+        degree=shard_count,
+        rank=rank if shard_count > 1 else 0,
+    )
+    return local[owned].tolist()
 
 
 @dataclass(frozen=True)

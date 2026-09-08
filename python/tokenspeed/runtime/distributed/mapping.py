@@ -48,6 +48,15 @@ def _resolve_parallelism_sizes(world_size: int, *sizes: int | None) -> tuple[int
     return tuple(resolved)
 
 
+def _resolve_dcp_size(tp_size: int, cp_size: int, dcp_size: int) -> int:
+    """Validate DCP within resolved attention TP; DCP adds no world-size dimension."""
+    if isinstance(dcp_size, bool) or not isinstance(dcp_size, int) or dcp_size < 1:
+        raise ValueError("dcp_size must be a positive integer")
+    if tp_size % dcp_size:
+        raise ValueError("attention TP size must be divisible by DCP size")
+    return dcp_size
+
+
 def _make_parallelism_rank(rank: int, size: int, stride: int = 1) -> int:
     """Return the rank of given size and stride."""
     return (rank // stride) % size
@@ -145,13 +154,7 @@ class AttentionLayerMapping(MappingBase):
         self.tp_size, self.cp_size, self.dp_size = _resolve_parallelism_sizes(
             self.world_size, tp_size, cp_size, dp_size
         )
-        if isinstance(dcp_size, bool) or not isinstance(dcp_size, int) or dcp_size < 1:
-            raise ValueError("dcp_size must be a positive integer")
-        if self.tp_size % dcp_size:
-            raise ValueError("attention TP size must be divisible by DCP size")
-        if dcp_size > 1 and self.cp_size > 1:
-            raise ValueError("DCP cannot be combined with attention CP")
-        self.dcp_size = dcp_size
+        self.dcp_size = _resolve_dcp_size(self.tp_size, self.cp_size, dcp_size)
 
     @property
     def has_dcp(self) -> bool:
@@ -160,16 +163,17 @@ class AttentionLayerMapping(MappingBase):
     @cached_property
     def dcp_rank(self) -> int:
         """Rank within the consecutive DCP subgroup of attention TP."""
-        return self.tp_rank % self.dcp_size
+        return _make_parallelism_rank(self.rank, self.dcp_size, stride=1)
 
     @cached_property
     def dcp_replica_rank(self) -> int:
-        return self.tp_rank // self.dcp_size
+        return _make_parallelism_rank(
+            self.rank, self.tp_size // self.dcp_size, stride=self.dcp_size
+        )
 
     @cached_property
     def dcp_group(self) -> Group:
-        start = self.dcp_replica_rank * self.dcp_size
-        return self.tp_group[start : start + self.dcp_size]
+        return _make_parallelism_group(self.rank, self.dcp_size, stride=1)
 
     @cached_property
     def has_tp(self) -> bool:

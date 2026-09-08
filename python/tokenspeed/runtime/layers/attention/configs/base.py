@@ -124,8 +124,9 @@ class AttnConfig:
     """The model's attention configuration: model-wide facts + components.
 
     Exactly one component is the softmax family (validated below); extra
-    components (linear attention) ride alongside as peers. Built exclusively
-    by ``registry._create_attn_config`` — one construction seam.
+    components (linear attention) ride alongside as peers. Family ``generate()``
+    methods construct the config; ``registry._create_attn_config`` composes
+    any extra components.
     """
 
     device: str
@@ -175,6 +176,8 @@ class AttnConfig:
                 "AttnConfig requires exactly one softmax-family component, got "
                 f"{[type(c).__name__ for c in self.components] or 'none'}"
             )
+        if self.dcp_size > 1 and softmax_components[0].backend_name != "deepseek_v4":
+            raise ValueError("DCP currently requires the DeepSeek V4 attention backend")
 
     def component(self, cls: type[ComponentT]) -> ComponentT | None:
         """The first component that is a ``cls``, or None.
@@ -224,6 +227,15 @@ def model_wide_kwargs(
         is_draft=is_draft,
         draft_block_decode=draft_block_decode,
     )
+    attn_mapping = server_args.mapping.attn
+    if attn_mapping.has_dcp:
+        kwargs.update(
+            dcp_size=attn_mapping.dcp_size,
+            dcp_rank=attn_mapping.dcp_rank,
+            dcp_group=attn_mapping.dcp_group,
+            dcp_comm_backend=server_args.dcp_comm_backend,
+            dcp_reference_backend=server_args.dcp_dsv4_reference_backend,
+        )
     if server_args.speculative_algorithm is not None:
         kwargs.update(
             speculative_num_steps=server_args.speculative_num_steps,

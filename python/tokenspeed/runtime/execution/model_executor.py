@@ -67,6 +67,9 @@ from tokenspeed.runtime.grammar.capturable_grammar import (
 from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
     CacheBatchMetadata,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
+    local_blocks,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     validate_scheduler_config,
 )
@@ -481,10 +484,20 @@ class ModelExecutor:
 
         attn_backend.configure_runtime(
             sliding_window_size=model_runner.sliding_window_size,
+            cache_group_specs=tuple(token_to_kv_pool.arena.cache_group_specs),
+            cache_group_page_counts=_cache_arena_attr(
+                token_to_kv_pool, "cache_group_page_counts", None
+            ),
         )
         if draft_attn_backend is not None:
             draft_attn_backend.configure_runtime(
                 sliding_window_size=model_runner.sliding_window_size,
+                cache_group_specs=tuple(
+                    _cache_arena_attr(draft_token_to_kv_pool, "cache_group_specs", ())
+                ),
+                cache_group_page_counts=_cache_arena_attr(
+                    draft_token_to_kv_pool, "cache_group_page_counts", None
+                ),
             )
 
         validate_cache_group_ids(
@@ -1168,10 +1181,25 @@ class ModelExecutor:
                     spec_step_idx=step_idx,
                 )
 
-    def zero_cache_pages(self, pages):
+    def zero_cache_pages(self, pages: Mapping):
         """Clear newly owned pages and return a CUDA completion event when needed."""
         if not pages:
             return None
+
+        if self.model_runner.mapping.attn.has_dcp:
+            contract = self._cache_runtime_contract
+            specs = {spec.group_id: spec for spec in contract.group_specs}
+            counts = contract.virtual_block_counts
+            rank = self.model_runner.mapping.attn.dcp_rank
+            pages = {
+                group_id: local_blocks(
+                    block_ids,
+                    shard_count=specs[group_id].shard_count,
+                    rank=rank,
+                    virtual_block_count=counts[group_id],
+                )
+                for group_id, block_ids in pages.items()
+            }
 
         def sanitize(pool, pool_pages) -> bool:
             zero_new_blocks = getattr(pool, "zero_new_blocks", None)

@@ -51,7 +51,7 @@ if TYPE_CHECKING:
         CacheSetup,
     )
 
-
+# One declared cache group: what the scheduler is told, and the bytes it costs.
 CacheGroupDeclaration = tuple[CacheGroupSpec, tuple[CacheFieldSpec, ...]]
 
 
@@ -104,7 +104,7 @@ class CacheRecipe(ABC):
             CacheSetup,
         )
 
-        groups = self._group_declarations
+        groups = self.groups()
         layout = pack(
             groups,
             prefix_granularity=self.prefix_granularity,
@@ -368,11 +368,7 @@ class CacheRecipe(ABC):
 
     @cached_property
     def _group_specs(self) -> tuple[CacheGroupSpec, ...]:
-        return tuple(spec for spec, _ in self._group_declarations)
-
-    @cached_property
-    def _group_declarations(self) -> tuple[CacheGroupDeclaration, ...]:
-        return self.groups()
+        return tuple(spec for spec, _ in self.groups())
 
     @cached_property
     def _shard_counts(self) -> dict[str, int]:
