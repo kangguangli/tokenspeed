@@ -29,7 +29,6 @@ import logging
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.ops.kvcache.triton_virtual_blocks import virtual_block_to_local
 from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -59,7 +58,6 @@ __all__ = [
     "dsv4_compute_global_topk_indices_and_lens",
     "dsv4_decode_swa_indices_and_lens",
     "dsv4_dequantize_and_gather_k_cache",
-    "dsv4_dequantize_selected_rows",
     "dsv4_fused_csa_indexer_fp8_cache_insert",
     "dsv4_fused_csa_indexer_mxfp4_cache_insert",
     "dsv4_fused_indexer_q_rope_hadamard_mxfp4",
@@ -634,68 +632,6 @@ def dsv4_pack_cache_rows(
     return out
 
 
-def dsv4_dequantize_selected_rows(
-    cache: torch.Tensor, slots: torch.Tensor, page_size: int
-) -> torch.Tensor:
-    """Read selected FP8 DSV4 cache rows for diagnostic reconstruction.
-
-    Args:
-        cache: Uint8 page-planar cache [local_pages, page_bytes], including
-            any trailing alignment padding. Page stride is read from the view.
-        slots: Local int32/int64 slots [queries, width]; invalid slots are zeroed.
-        page_size: Physical rows per page, unchanged by DCP.
-
-    Returns:
-        BF16 rows [queries, width, 512], preserving selection order and holes.
-    """
-    row_bytes = DEEPSEEK_V4_SWA_TOKEN_STRIDE + DEEPSEEK_V4_SWA_SCALE_DIM
-    if (
-        cache.ndim != 2
-        or cache.dtype != torch.uint8
-        or page_size <= 0
-        or cache.shape[1] < page_size * row_bytes
-        or cache.stride(1) != 1
-    ):
-        raise ValueError("expected a DSV4 FP8 page-planar cache")
-    if slots.ndim != 2 or slots.dtype not in (torch.int32, torch.int64):
-        raise ValueError("selected slots must be a 2D integer tensor")
-    if cache.device != slots.device or not cache.is_cuda:
-        raise ValueError("selected cache and slots must share a GPU")
-    slots = slots.contiguous()
-    output = torch.empty(
-        (*slots.shape, DEEPSEEK_V4_HEAD_DIM), dtype=torch.bfloat16, device=cache.device
-    )
-    if slots.numel() == 0:
-        return output
-    _dsv4_dequantize_selected_cache_rows_kernel[tuple(slots.shape)](
-        cache,
-        slots,
-        slots,
-        output,
-        slots,
-        slots,
-        cache.stride(0),
-        slots.stride(0),
-        slots.stride(0),
-        output.stride(0),
-        output.stride(1),
-        page_size,
-        cache.shape[0] * page_size,
-        OUTPUT_ROW_OFFSET=0,
-        INDEX_OFFSET=0,
-        WORKSPACE_WIDTH=slots.shape[1],
-        HAS_METADATA=False,
-        HEAD_DIM=DEEPSEEK_V4_HEAD_DIM,
-        NOPE_DIM=DEEPSEEK_V4_NOPE_DIM,
-        ROPE_DIM=DEEPSEEK_V4_ROPE_DIM,
-        QUANT_BLOCK=DEEPSEEK_V4_FP8_QUANT_BLOCK,
-        TOKEN_STRIDE=DEEPSEEK_V4_SWA_TOKEN_STRIDE,
-        SCALE_DIM=DEEPSEEK_V4_SWA_SCALE_DIM,
-        BLOCK_DIM=triton.next_power_of_2(DEEPSEEK_V4_NOPE_DIM),
-    )
-    return output
-
-
 def _dsv4_dequantize_selected_cache_segment(
     cache_2d: torch.Tensor,
     slots: torch.Tensor,
@@ -764,7 +700,6 @@ def _dsv4_dequantize_selected_cache_segment(
         "cache_layout": frozenset({"fp8_swa_page_planar"}),
         "topk_layout": frozenset({"global_slots"}),
         "support_sink": frozenset({True}),
-        "return_lse": frozenset({False}),
         "has_extra_segment": frozenset({False, True}),
         "metadata_dtypes": frozenset({torch.int32, torch.int64}),
     },
@@ -2087,9 +2022,6 @@ def _dsv4_dequantize_and_gather_k_kernel(
     block_stride: tl.constexpr,
     fp8_max: tl.constexpr,
     n_quant_blocks: tl.constexpr,
-    DCP_DEGREE: tl.constexpr = 1,
-    DCP_RANK: tl.constexpr = 0,
-    LOCAL_PAGES: tl.constexpr = 0,
 ):
     batch_idx = tl.program_id(0)
     worker_id = tl.program_id(1)
@@ -2117,11 +2049,6 @@ def _dsv4_dequantize_and_gather_k_kernel(
             other=-1,
         )
         valid_block = valid_block & (physical_block_idx >= 0)
-        if DCP_DEGREE > 1:
-            physical_block_idx, owned = virtual_block_to_local(
-                physical_block_idx, DCP_DEGREE, DCP_RANK
-            )
-            valid_block = valid_block & owned & (physical_block_idx < LOCAL_PAGES)
         cache_block = k_cache_ptr + physical_block_idx.to(tl.int64) * block_stride
 
         token_data = cache_block + pos_in_block * token_data_size
@@ -2186,8 +2113,6 @@ def dsv4_dequantize_and_gather_k_cache(
     offset: int,
     block_table_base_offsets: torch.Tensor | None = None,
     max_gather_len: int | None = None,
-    dcp_degree: int = 1,
-    dcp_rank: int = 0,
 ) -> None:
     """Gather/dequantize fp8_ds_mla cache rows for sparse prefill."""
 
@@ -2234,9 +2159,6 @@ def dsv4_dequantize_and_gather_k_cache(
         block_stride=cache_2d.stride(0),
         fp8_max=DEEPSEEK_V4_FP8_MAX,
         n_quant_blocks=DEEPSEEK_V4_NOPE_DIM // DEEPSEEK_V4_FP8_QUANT_BLOCK,
-        DCP_DEGREE=dcp_degree,
-        DCP_RANK=dcp_rank,
-        LOCAL_PAGES=cache_2d.shape[0],
         num_warps=num_warps,
     )
 

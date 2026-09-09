@@ -465,6 +465,11 @@ publisher of `CacheRuntimeContract`, whose virtual counts and packing derive
 from these physical facts and each spec's `shard_count`. No separate placement
 or per-group address-space object is needed.
 
+DeepSeek V4 DCP decode gathers query heads, computes local no-sink attention
+partials, and combines them with LSE before applying the sink once. Prefill
+gathers packed cache bytes into a transient workspace and uses the ordinary
+local-page dequantizer to restore the rows.
+
 Attention backends bind their compute view through `set_cache_pool()` and read
 `cache_pool.arena.runtime_contract`. Target and draft views share that arena;
 executor and graph setup do not inject another V4 contract or group geometry.

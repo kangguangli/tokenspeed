@@ -36,15 +36,13 @@ from tokenspeed_kernel.ops.attention.triton.dsv4 import (
     dsv4_compute_global_topk_indices_and_lens,
     dsv4_decode_swa_indices_and_lens,
     dsv4_dequantize_and_gather_k_cache,
-    dsv4_dequantize_selected_rows,
     dsv4_indexer_decode_metadata_compute,
     dsv4_pack_cache_rows,
 )
-from tokenspeed_kernel.ops.attention.triton.dsv4_dcp import dsv4_dcp_selected_slots
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
-from tokenspeed.runtime.distributed.comm_ops import all_reduce, token_all_gather
+from tokenspeed.runtime.distributed.comm_ops import token_all_gather
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
@@ -53,7 +51,6 @@ from tokenspeed.runtime.layers.attention.dcp.comm import (
     combine_attention_partials,
     gather_query_heads,
 )
-from tokenspeed.runtime.layers.attention.dcp.reference import selected_kv_attention
 from tokenspeed.runtime.layers.attention.deepseek_v4.metadata import (
     DeepseekV4CompressedAttentionMetadata,
     DeepseekV4DcpPrefillChunk,
@@ -305,7 +302,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self.dcp_rank = getattr(config, "dcp_rank", 0)
         self.dcp_group = getattr(config, "dcp_group", ())
         self.dcp_comm_backend = getattr(config, "dcp_comm_backend", "auto")
-        self.dcp_reference_backend = getattr(config, "dcp_reference_backend", None)
         # Per-sliding-group [max_bs] int32 buffers mirroring the block-table
         # buffers; populated by init_cuda_graph_state.
         self._cuda_graph_block_table_base_offsets: dict[str, torch.Tensor] = {}
@@ -1382,53 +1378,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             compressed_table_capacity=compressed_table_capacity,
         )
 
-    def _dcp_selected_compressed_rows(
-        self,
-        positions: torch.Tensor,
-        *,
-        compress_ratio: int,
-        block_size: int,
-        topk_indices: torch.Tensor | None,
-        return_global_valid: bool = False,
-        out_scan_lens: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        metadata = self.forward_metadata
-        if metadata is None:
-            raise RuntimeError("DeepSeek V4 DCP requires forward metadata")
-        if compress_ratio == 4:
-            if topk_indices is None:
-                raise RuntimeError("DeepSeek V4 CSA decode requires top-k indices")
-            candidates = topk_indices
-        else:
-            width = self._dense_compressed_indices_width(compress_ratio)
-            candidates = torch.arange(width, device=positions.device, dtype=torch.int32)
-            candidates = candidates.unsqueeze(0).expand(positions.numel(), -1)
-        group_id = v4_compressed_kv_group_id(compress_ratio)
-        contract = metadata.cache.runtime_contract
-        assert contract is not None
-        return dsv4_dcp_selected_slots(
-            candidates,
-            positions=positions,
-            token_to_req_indices=metadata.token_to_req_indices[: positions.numel()],
-            block_table=metadata.cache.compressed_page_table(compress_ratio),
-            rows_per_page=block_size,
-            compress_ratio=compress_ratio,
-            virtual_block_count=contract.virtual_block_counts[group_id],
-            degree=self.dcp_size,
-            rank=self.dcp_rank,
-            block_table_base_offsets=_compressed_block_table_base_offsets(
-                metadata, compress_ratio
-            ),
-            is_valid_token=(
-                metadata.is_valid_token[: positions.numel()]
-                if metadata.is_valid_token is not None
-                else None
-            ),
-            compact=False,
-            return_global_valid=return_global_valid,
-            out_scan_lens=out_scan_lens,
-        )
-
     def forward_deepseek_v4_decode(
         self,
         *,
@@ -1536,39 +1485,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             window_size=window_size,
             block_size=token_to_kv_pool.swa_block_size,
         )
-        if self.dcp_reference_backend == "selected_kv":
-            rows = token_to_kv_pool.get_compressed_block_size(layer_id)
-            extra_slots, _, extra_valid = self._dcp_selected_compressed_rows(
-                positions,
-                compress_ratio=compress_ratio,
-                block_size=rows,
-                topk_indices=topk_indices,
-                return_global_valid=True,
-            )
-            extra = dsv4_dequantize_selected_rows(
-                token_to_kv_pool.get_compressed_kv_buffer_2d(layer_id),
-                extra_slots,
-                rows,
-            )
-            # Every selected row has one owner. SUM reconstructs only these
-            # transient rows; no replicated persistent cache is introduced.
-            extra = all_reduce(extra, self.dcp_group)
-            swa_valid = (
-                torch.arange(swa_slots.shape[-1], device=q.device)[None, :]
-                < swa_lens.reshape(-1, 1)
-            ) & (swa_slots >= 0)
-            swa = dsv4_dequantize_selected_rows(
-                token_to_kv_pool.get_swa_kv_buffer(layer_id),
-                torch.where(swa_valid, swa_slots, -1),
-                token_to_kv_pool.swa_block_size,
-            )
-            return selected_kv_attention(
-                q,
-                torch.cat((swa, extra), dim=1),
-                torch.cat((swa_valid, extra_valid), dim=1),
-                attn_sink[: q.shape[1]],
-                softmax_scale,
-            )
         # SWA is replicated. Count it on exactly one context shard.
         local_swa_lens = swa_lens
         if self.dcp_rank != 0:
