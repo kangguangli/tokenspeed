@@ -177,36 +177,9 @@ def _v4_backend(flat: SimpleNamespace) -> DeepseekV4AttentionBackend:
     spec_fields = {k: v for k, v in fields.items() if k in _V4_SPEC_FIELDS}
     spec_fields.setdefault("sliding_window_tokens", None)
     config_fields = {k: v for k, v in fields.items() if k not in _V4_SPEC_FIELDS}
-    backend = DeepseekV4AttentionBackend(
+    return DeepseekV4AttentionBackend(
         SimpleNamespace(**config_fields), SimpleNamespace(**spec_fields)
     )
-    # Isolated metadata tests have no arena allocation; graph tests with groups
-    # bind a validated contract through _bind_cache_groups below.
-    backend.cache_pool = _fake_pool(
-        runtime_contract=SimpleNamespace(group_specs=(), virtual_block_counts={})
-    )
-    return backend
-
-
-def _contract_pool(specs, counts):
-    from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
-        CacheRuntimeContract,
-    )
-
-    contract = CacheRuntimeContract(
-        prefix_granularity=256,
-        num_lcm_blocks=1,
-        token_capacity=256,
-        group_specs=tuple(specs),
-        group_page_counts=counts,
-        group_packing={group_id: count - 1 for group_id, count in counts.items()},
-    )
-    return _fake_pool(*specs, runtime_contract=contract)
-
-
-def _bind_cache_groups(backend, cache_group_specs, cache_group_page_counts):
-    backend.cache_pool = None  # Replace the unconfigured metadata-test double.
-    backend.set_cache_pool(_contract_pool(cache_group_specs, cache_group_page_counts))
 
 
 def _v4_spec_set(hf_config, *, layer_ratio, decode_input_tokens: int = 1):
@@ -2694,7 +2667,10 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
         counts = {"fine": 20001, "coarse": 1025}
 
-        _bind_cache_groups(backend, specs, counts)
+        backend.configure_runtime(
+            cache_group_specs=specs,
+            cache_group_page_counts=counts,
+        )
         tables = {
             "fine": torch.ones((1, 1), dtype=torch.int32),
             "coarse": torch.ones((1, 1), dtype=torch.int32),
@@ -2710,10 +2686,14 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertEqual(tuple(materialized), ("fine", "coarse"))
 
         # Graph setup may repeat the same contract but must not replace it.
-        backend.init_cuda_graph_state(max_bs=1)
+        backend.init_cuda_graph_state(
+            max_bs=1,
+            cache_group_specs=specs,
+            cache_group_page_counts=counts,
+        )
         changed = {"fine": 20002, "coarse": 1025}
         with self.assertRaisesRegex(RuntimeError, "changed after initialization"):
-            backend.set_cache_pool(_contract_pool(specs, changed))
+            backend._configure_cache_group_contract(specs, changed)
 
     def test_deepseek_v4_cache_group_contract_covers_64k_boundary(self):
         backend = self._make_deepseek_v4_cache_group_contract_backend()
@@ -2903,10 +2883,18 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         target = make_backend(is_draft=False)
         draft = make_backend(is_draft=True)
-        _bind_cache_groups(target, target_specs, target_counts)
-        target.init_cuda_graph_state(max_bs=2, max_tokens_per_req=4)
-        _bind_cache_groups(draft, draft_specs, draft_counts)
-        draft.init_cuda_graph_state(max_bs=2, max_tokens_per_req=4)
+        target.init_cuda_graph_state(
+            max_bs=2,
+            cache_group_specs=target_specs,
+            cache_group_page_counts=target_counts,
+            max_tokens_per_req=4,
+        )
+        draft.init_cuda_graph_state(
+            max_bs=2,
+            cache_group_specs=draft_specs,
+            cache_group_page_counts=draft_counts,
+            max_tokens_per_req=4,
+        )
 
         common = {
             "bs": 2,
@@ -3489,9 +3477,9 @@ class TestDeepseekV4Config(unittest.TestCase):
                 context_len=4096,
             )
         )
-        _bind_cache_groups(
-            backend,
-            (
+        backend.init_cuda_graph_state(
+            2,
+            cache_group_specs=(
                 CacheGroupSpec(
                     group_id="v4.swa_kv",
                     retention="sliding_window",
@@ -3500,9 +3488,9 @@ class TestDeepseekV4Config(unittest.TestCase):
                     sliding_window_tokens=128,
                 ),
             ),
-            {"v4.swa_kv": 1024},
+            cache_group_page_counts={"v4.swa_kv": 1024},
+            max_tokens_per_req=1,
         )
-        backend.init_cuda_graph_state(2, max_tokens_per_req=1)
         compact = torch.tensor([[10, 11], [20, -1]], dtype=torch.int32)
         refreshed = backend._refresh_cuda_graph_block_tables(
             2,
@@ -3880,18 +3868,16 @@ class TestDeepseekV4Config(unittest.TestCase):
                 context_len=256,
             )
         )
-        _bind_cache_groups(
-            backend,
-            (
-                CacheGroupSpec(
+        backend.configure_runtime(
+            cache_group_specs=(
+                SimpleNamespace(
                     group_id=V4_SWA_KV_GROUP_ID,
                     retention="sliding_window",
                     rows_per_page=64,
                     entry_stride_tokens=1,
-                    sliding_window_tokens=128,
                 ),
             ),
-            {V4_SWA_KV_GROUP_ID: 128},
+            cache_group_page_counts={V4_SWA_KV_GROUP_ID: 128},
         )
         backend.init_forward_metadata(
             bs=3,
@@ -4434,7 +4420,6 @@ class TestDeepseekV4Config(unittest.TestCase):
                 speculative_num_draft_tokens=4,
             )
         )
-        backend.set_cache_pool(backend.cache_pool)
         backend.init_cuda_graph_state(max_bs=2, max_tokens_per_req=4)
         backend.init_forward_metadata_capture_cuda_graph(
             bs=2,
@@ -4785,7 +4770,6 @@ class TestDeepseekV4Config(unittest.TestCase):
                 context_len=128,
             )
         )
-        backend.set_cache_pool(backend.cache_pool)
         backend.init_cuda_graph_state(max_bs=4)
         backend.init_forward_metadata_capture_cuda_graph(
             bs=4,
@@ -4837,9 +4821,9 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
         )
         group_id = v4_compressed_kv_group_id(4)
-        _bind_cache_groups(
-            backend,
-            (
+        backend.init_cuda_graph_state(
+            max_bs=4,
+            cache_group_specs=(
                 CacheGroupSpec(
                     group_id=group_id,
                     retention="full_history",
@@ -4848,9 +4832,8 @@ class TestDeepseekV4Config(unittest.TestCase):
                     sliding_window_tokens=None,
                 ),
             ),
-            {group_id: 128},
+            cache_group_page_counts={group_id: 128},
         )
-        backend.init_cuda_graph_state(max_bs=4)
         backend.init_forward_metadata_capture_cuda_graph(
             bs=4,
             req_pool_indices=torch.arange(4, dtype=torch.int32),
@@ -5042,7 +5025,6 @@ class TestDeepseekV4Config(unittest.TestCase):
                 speculative_num_draft_tokens=4,
             )
         )
-        backend.set_cache_pool(backend.cache_pool)
         backend.init_cuda_graph_state(max_bs=4)
         backend.init_forward_metadata_capture_cuda_graph(
             bs=4,
@@ -5125,7 +5107,6 @@ class TestDeepseekV4Config(unittest.TestCase):
                 speculative_num_draft_tokens=4,
             )
         )
-        backend.set_cache_pool(backend.cache_pool)
         backend.init_cuda_graph_state(max_bs=4)
         backend.init_forward_metadata_capture_cuda_graph(
             bs=4,
@@ -5219,7 +5200,6 @@ class TestDeepseekV4Config(unittest.TestCase):
                 speculative_num_draft_tokens=4,
             )
         )
-        backend.set_cache_pool(backend.cache_pool)
         backend.init_cuda_graph_state(max_bs=4)
         backend.init_forward_metadata_capture_cuda_graph(
             bs=4,
