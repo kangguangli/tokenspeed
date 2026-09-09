@@ -24,7 +24,10 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.ops.kvcache.triton_virtual_blocks import virtual_block_to_local
+from tokenspeed_kernel.ops.kvcache.triton_virtual_blocks import (
+    virtual_block_to_local,
+    virtual_slots_to_local,
+)
 
 
 @triton.jit
@@ -264,8 +267,15 @@ def dsv4_dcp_selected_slots(
             global_valid.zero_()
         if out_scan_lens is not None:
             out_scan_lens.zero_()
-        # Independent scalar reference; CPU tests exercise non-cyclic logical
-        # order, causal holes and skewed selection instead of GPU arithmetic.
+        local_blocks, owned_blocks = virtual_slots_to_local(
+            block_table,
+            rows_per_page=1,
+            virtual_block_count=virtual_block_count,
+            degree=degree,
+            rank=rank,
+        )
+        # Keep scalar selection as a reference for logical order and causal
+        # holes; block ownership shares the cache translator with other paths.
         for query in range(queries):
             req = int(token_to_req_indices[query])
             causal = max(0, (int(positions[query]) + 1) // compress_ratio)
@@ -293,11 +303,12 @@ def dsv4_dcp_selected_slots(
                     continue
                 if global_valid is not None:
                     global_valid[query, column] = True
-                if (virtual - 1) % degree != rank:
+                if not owned_blocks[req, page_column]:
                     continue
                 slot = (
-                    (virtual - 1) // degree + 1
-                ) * rows_per_page + entry % rows_per_page
+                    int(local_blocks[req, page_column]) * rows_per_page
+                    + entry % rows_per_page
+                )
                 if not compact:
                     output[query, column] = slot
                 owned_slots.append(slot)

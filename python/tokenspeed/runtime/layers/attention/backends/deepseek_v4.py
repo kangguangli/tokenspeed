@@ -38,11 +38,13 @@ from tokenspeed_kernel.ops.attention.triton.dsv4 import (
     dsv4_dequantize_and_gather_k_cache,
     dsv4_dequantize_selected_rows,
     dsv4_indexer_decode_metadata_compute,
+    dsv4_pack_cache_rows,
 )
 from tokenspeed_kernel.ops.attention.triton.dsv4_dcp import dsv4_dcp_selected_slots
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
-from tokenspeed.runtime.distributed.comm_ops import all_reduce
+from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
+from tokenspeed.runtime.distributed.comm_ops import all_reduce, token_all_gather
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
@@ -54,13 +56,16 @@ from tokenspeed.runtime.layers.attention.dcp.comm import (
 from tokenspeed.runtime.layers.attention.dcp.reference import selected_kv_attention
 from tokenspeed.runtime.layers.attention.deepseek_v4.metadata import (
     DeepseekV4CompressedAttentionMetadata,
+    DeepseekV4DcpPrefillChunk,
     DeepseekV4ForwardMetadata,
 )
 from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
     DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT,
     V4_KERNEL_BLOCK_ROWS,
     first_v4_compressed_kv_group_id,
+    parse_v4_compressed_kv_group_id,
     v4_compressed_kv_group_id,
+    v4_compressed_rows_per_page,
 )
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     DEEPSEEK_V4_PAGE_SIZE,
@@ -308,6 +313,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self._prefill_workspace_buffer: torch.Tensor | None = None
         self._prefill_workspace_rows = 0
         self._prefill_workspace_head_dim = 0
+        # Byte collectives must not select the BF16-only token RSAG backend.
+        self._dcp_prefill_comm = NcclBackend()
+        self._dcp_prefill_dequantized: torch.Tensor | None = None
         self._prefill_dense_compressed_indices_buffer: torch.Tensor | None = None
         self._decode_swa_window_size = 0
         self._decode_swa_block_size = 0
@@ -342,11 +350,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         for spec in contract.group_specs:
             expected_shards = (
                 self.dcp_size
-                if spec.group_id
-                in (
-                    v4_compressed_kv_group_id(4),
-                    v4_compressed_kv_group_id(128),
-                )
+                if parse_v4_compressed_kv_group_id(spec.group_id) is not None
                 else 1
             )
             if spec.shard_count != expected_shards:
@@ -1120,6 +1124,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             num_prefill_tokens=num_prefill_tokens,
             forward_mode=metadata_forward_mode,
         )
+        self._prepare_dcp_prefill_metadata(self.forward_metadata)
         if is_packed_decode:
             self.forward_decode_metadata = self.forward_metadata
             if getattr(self, "is_draft", False):
@@ -1742,23 +1747,190 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             self.forward_metadata = saved_metadata
         return out
 
-    def _gather_compressed_prefill(self, **kwargs) -> None:
-        """Reconstruct transient compressed history from disjoint owner rows."""
-        out = kwargs["out"]
-        width = kwargs["max_gather_len"]
-        offset = kwargs["offset"]
-        segment = out[:, offset : offset + width]
-        if self.dcp_size > 1:
-            # Unequal request lengths leave padding unwritten by the gather.
-            # Zero it before collective reconstruction, including empty rows.
-            segment.zero_()
-        dsv4_dequantize_and_gather_k_cache(
-            **kwargs, dcp_degree=self.dcp_size, dcp_rank=self.dcp_rank
+    @staticmethod
+    def _build_dcp_prefill_chunks(
+        metadata: DeepseekV4ForwardMetadata,
+        compress_ratio: int,
+        *,
+        chunk_size: int,
+        window_size: int,
+    ) -> dict[tuple[int, int], DeepseekV4DcpPrefillChunk]:
+        """Plan raw-byte gathers for complete history and restore TP row order."""
+        workspace_bounds = DeepseekV4AttentionBackend._prefill_workspace_bounds
+        cache = metadata.cache
+        degree, rank = cache.dcp_size, cache.dcp_rank
+        count = metadata.num_prefill_reqs
+        if degree <= 1 or chunk_size <= 0 or count <= 0:
+            raise ValueError("DCP prefill planning requires a nonempty prefill batch")
+        seq_cpu = (
+            metadata.seq_lens_cpu[:count] if metadata.seq_lens_cpu is not None else None
         )
-        if self.dcp_size > 1 and width > 0:
-            compressed = segment.contiguous()
-            compressed = all_reduce(compressed, self.dcp_group)
-            segment.copy_(compressed)
+        query_cpu = (
+            metadata.query_lens_cpu[:count]
+            if metadata.query_lens_cpu is not None
+            else None
+        )
+        workspace_bounds(
+            seq_cpu,
+            query_cpu,
+            num_reqs=count,
+            window_size=window_size,
+            compress_ratio=compress_ratio,
+        )
+        row_counts = [s // compress_ratio for s in seq_cpu.tolist()]
+        gid = v4_compressed_kv_group_id(compress_ratio)
+        rows_per_page = v4_compressed_rows_per_page(compress_ratio)
+        table = cache.compressed_page_table(compress_ratio)[:count].cpu().tolist()
+        bases_tensor = cache.block_table_base_offsets.get(gid)
+        bases = (
+            bases_tensor[:count].cpu().tolist()
+            if bases_tensor is not None
+            else [0] * count
+        )
+        virtual_count = cache.runtime_contract.virtual_block_counts[gid]
+        device = metadata.seq_lens.device
+
+        def tensor(values, dtype=torch.int64):
+            return torch.tensor(values, dtype=dtype, device=device)
+
+        chunks = {}
+        for start in range(0, count, chunk_size):
+            end = min(start + chunk_size, count)
+            swa_width, compressed_width = workspace_bounds(
+                seq_cpu[start:end],
+                query_cpu[start:end],
+                num_reqs=end - start,
+                window_size=window_size,
+                compress_ratio=compress_ratio,
+            )
+            width = max(1, swa_width + compressed_width)
+            destinations = [[] for _ in range(degree)]
+            local_slots, zero_destinations = [], []
+            for req in range(start, end):
+                request_base = (req - start) * width
+                for entry_start in range(0, row_counts[req], rows_per_page):
+                    page_column = entry_start // rows_per_page - bases[req]
+                    virtual = (
+                        table[req][page_column]
+                        if 0 <= page_column < len(table[req])
+                        else 0
+                    )
+                    entries = range(
+                        entry_start, min(entry_start + rows_per_page, row_counts[req])
+                    )
+                    if not 0 < virtual < virtual_count:
+                        zero_destinations.extend(request_base + e for e in entries)
+                        continue
+                    owner = (virtual - 1) % degree
+                    destinations[owner].extend(request_base + e for e in entries)
+                    if owner == rank:
+                        local_page = (virtual - 1) // degree + 1
+                        local_slots.extend(
+                            local_page * rows_per_page + e % rows_per_page
+                            for e in entries
+                        )
+            counts = [len(rows) for rows in destinations]
+            total_rows = sum(counts)
+            chunks[start, end] = DeepseekV4DcpPrefillChunk(
+                slots=tensor(local_slots),
+                counts=counts,
+                destinations=tensor([row for rows in destinations for row in rows]),
+                zero_destinations=tensor(zero_destinations),
+                packed_page_table=torch.arange(
+                    total_rows, dtype=torch.int32, device=device
+                )[None],
+                packed_lens=tensor([total_rows], torch.int32),
+                workspace_width=width,
+            )
+        return chunks
+
+    def _prepare_dcp_prefill_metadata(
+        self, metadata: DeepseekV4ForwardMetadata
+    ) -> None:
+        if self.dcp_size <= 1 or metadata.num_prefill_reqs <= 0:
+            return
+        metadata.dcp_prefill = {}
+        for group_id in metadata.cache.block_tables:
+            ratio = parse_v4_compressed_kv_group_id(group_id)
+            if ratio is None:
+                continue
+            metadata.dcp_prefill[ratio] = self._build_dcp_prefill_chunks(
+                metadata,
+                ratio,
+                chunk_size=self.prefill_chunk_size,
+                window_size=self.swa_storage_rows,
+            )
+        rows = max(
+            (
+                chunk.destinations.numel()
+                for plan in metadata.dcp_prefill.values()
+                for chunk in plan.values()
+            ),
+            default=0,
+        )
+        if rows and (
+            self._dcp_prefill_dequantized is None
+            or self._dcp_prefill_dequantized.shape[0] < rows
+        ):
+            self._dcp_prefill_dequantized = torch.empty(
+                (rows, self.head_dim), dtype=torch.bfloat16, device=self.device
+            )
+
+    def _gather_compressed_prefill(
+        self,
+        *,
+        compress_ratio: int,
+        out: torch.Tensor,
+        cache_2d: torch.Tensor,
+        seq_lens: torch.Tensor,
+        gather_lens: torch.Tensor | None,
+        block_table: torch.Tensor,
+        block_size: int,
+        offset: int,
+        block_table_base_offsets: torch.Tensor | None = None,
+        max_gather_len: int | None = None,
+    ) -> None:
+        """Gather prefix and newly computed KV together in their original bytes."""
+        if self.dcp_size == 1:
+            dsv4_dequantize_and_gather_k_cache(
+                out=out,
+                cache_2d=cache_2d,
+                seq_lens=seq_lens,
+                gather_lens=gather_lens,
+                block_table=block_table,
+                block_size=block_size,
+                offset=offset,
+                block_table_base_offsets=block_table_base_offsets,
+                max_gather_len=max_gather_len,
+            )
+            return
+        metadata = self.forward_metadata
+        start = metadata.prefill_req_offset
+        chunk = metadata.dcp_prefill[compress_ratio][start, start + out.shape[0]]
+        if offset != 0 or out.shape[1] != chunk.workspace_width:
+            raise RuntimeError("DCP prefill workspace differs from its prepared layout")
+        flat_out = out.view(-1, out.shape[-1])
+        if chunk.zero_destinations.numel():
+            flat_out.index_fill_(0, chunk.zero_destinations, 0)
+        count = chunk.destinations.numel()
+        if not count:
+            return
+        local = dsv4_pack_cache_rows(cache_2d, chunk.slots, block_size)
+        packed = token_all_gather(
+            local, self.dcp_group, chunk.counts, backend=self._dcp_prefill_comm
+        )
+        decoded = self._dcp_prefill_dequantized[:count].unsqueeze(0)
+        dsv4_dequantize_and_gather_k_cache(
+            out=decoded,
+            cache_2d=packed,
+            seq_lens=chunk.packed_lens,
+            gather_lens=None,
+            block_table=chunk.packed_page_table,
+            block_size=1,
+            offset=0,
+            max_gather_len=count,
+        )
+        flat_out.index_copy_(0, chunk.destinations, decoded[0])
 
     def _prefill_workspace(
         self,
@@ -1820,6 +1992,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 compressed_page_table.shape[1] * compressed_block_size
             )
             self._gather_compressed_prefill(
+                compress_ratio=compress_ratio,
                 out=kv_workspace,
                 cache_2d=compressed_cache,
                 seq_lens=compressed_lens,
@@ -1882,6 +2055,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 compressed_page_table.shape[1] * compressed_block_size
             )
             self._gather_compressed_prefill(
+                compress_ratio=compress_ratio,
                 out=kv_workspace,
                 cache_2d=compressed_cache,
                 seq_lens=compressed_lens,
@@ -2087,6 +2261,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             num_prefill_reqs=num_prefill_reqs,
             num_prefill_tokens=num_prefill_tokens,
             forward_mode=forward_mode,
+            dcp_prefill=metadata.dcp_prefill,
+            prefill_req_offset=metadata.prefill_req_offset + req_start,
         )
 
     def _forward_deepseek_v4_prefill_chunk(

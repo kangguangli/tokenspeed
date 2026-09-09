@@ -67,6 +67,7 @@ __all__ = [
     "dsv4_fused_sparse_compress_cache_insert",
     "dsv4_gather_indexer_mxfp4_cache",
     "dsv4_indexer_decode_metadata_compute",
+    "dsv4_pack_cache_rows",
     "dsv4_save_compressor_state",
     "dsv4_sparse_attention",
     "write_dsv4_indexer_mxfp4_cache_cuda",
@@ -538,6 +539,99 @@ def _dsv4_dequantize_selected_cache_rows_kernel(
             WORKSPACE_WIDTH,
             mask=row_idx == 0,
         )
+
+
+@triton.jit
+def _dsv4_pack_cache_rows_kernel(
+    cache,
+    slots,
+    output,
+    page_stride,
+    cache_capacity,
+    PAGE_ROWS: tl.constexpr,
+    DATA_BYTES: tl.constexpr,
+    SCALE_BYTES: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    slot = tl.load(slots + row).to(tl.int64)
+    valid = (slot >= 0) & (slot < cache_capacity)
+    safe_slot = tl.where(valid, slot, 0)
+    page = safe_slot // PAGE_ROWS
+    page_row = safe_slot % PAGE_ROWS
+    offsets = tl.arange(0, BLOCK)
+    row_bytes: tl.constexpr = DATA_BYTES + SCALE_BYTES
+    source = page * page_stride + tl.where(
+        offsets < DATA_BYTES,
+        page_row * DATA_BYTES + offsets,
+        PAGE_ROWS * DATA_BYTES + page_row * SCALE_BYTES + offsets - DATA_BYTES,
+    )
+    values = tl.load(cache + source, mask=valid & (offsets < row_bytes), other=0)
+    tl.store(output + row * row_bytes + offsets, values, mask=offsets < row_bytes)
+
+
+def dsv4_pack_cache_rows(
+    cache: torch.Tensor,
+    slots: torch.Tensor,
+    page_size: int,
+    *,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Pack cache rows as bytes without changing their quantized representation.
+
+    Args:
+        cache: Uint8 page-planar DSV4 cache [pages, page_bytes]. Its actual
+            page stride may include arena alignment padding.
+        slots: Contiguous one-dimensional int32/int64 local slot IDs. Invalid
+            slots produce zero bytes without reading the reserved null page.
+        page_size: Physical rows per cache page.
+        out: Optional contiguous uint8 output [slots, 584] on the same GPU.
+
+    Returns:
+        Packed rows containing the 576 payload/RoPE bytes followed by eight
+        scale bytes. Each row is also a valid one-row DSV4 cache page, so the
+        existing cache dequantizer can consume it with page_size=1.
+    """
+    row_bytes = DEEPSEEK_V4_SWA_TOKEN_STRIDE + DEEPSEEK_V4_SWA_SCALE_DIM
+    if (
+        cache.ndim != 2
+        or cache.dtype != torch.uint8
+        or page_size <= 0
+        or cache.shape[1] < page_size * row_bytes
+        or cache.stride(1) != 1
+    ):
+        raise ValueError("expected a DSV4 FP8 page-planar cache")
+    if (
+        slots.ndim != 1
+        or slots.dtype not in (torch.int32, torch.int64)
+        or not slots.is_contiguous()
+    ):
+        raise ValueError("cache packing slots must be a contiguous integer vector")
+    if not cache.is_cuda or cache.device != slots.device:
+        raise ValueError("packed cache and slots must share a GPU")
+    shape = (slots.numel(), row_bytes)
+    if out is None:
+        out = torch.empty(shape, dtype=torch.uint8, device=cache.device)
+    elif (
+        out.shape != shape
+        or out.dtype != torch.uint8
+        or out.device != cache.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError("packed cache output shape, dtype or device is invalid")
+    if slots.numel():
+        _dsv4_pack_cache_rows_kernel[(slots.numel(),)](
+            cache,
+            slots,
+            out,
+            cache.stride(0),
+            cache.shape[0] * page_size,
+            PAGE_ROWS=page_size,
+            DATA_BYTES=DEEPSEEK_V4_SWA_TOKEN_STRIDE,
+            SCALE_BYTES=DEEPSEEK_V4_SWA_SCALE_DIM,
+            BLOCK=triton.next_power_of_2(row_bytes),
+        )
+    return out
 
 
 def dsv4_dequantize_selected_rows(
