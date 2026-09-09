@@ -117,11 +117,6 @@ class DeepseekV4AttentionMetadata:
         default_factory=set
     )
 
-    def clear_compressed_cache(self) -> None:
-        """Invalidate C128 selection when reused metadata inputs change."""
-        self.decode_compressed_cache.clear()
-        self.decode_compressed_capture_safe_keys.clear()
-
 
 @dataclass
 class DeepseekV4IndexerMetadata:

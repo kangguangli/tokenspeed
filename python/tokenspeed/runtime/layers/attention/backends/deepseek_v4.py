@@ -781,6 +781,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             if is_cuda_graph_metadata:
                 self._cuda_graph_draft_decode_metadata[bs] = metadata
             self._draft_decode_metadata = metadata
+            metadata.cache.prepare_compressed_attention_page_tables()
             if self._decode_swa_window_size > 0 and self._decode_swa_block_size > 0:
                 self._update_decode_swa_metadata(
                     metadata,
@@ -825,7 +826,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             max_context_len=self.context_len,
         )
         _refresh_decode_indexer_schedule_metadata(metadata)
-        metadata.attention.clear_compressed_cache()
+        metadata.cache.prepare_compressed_attention_page_tables()
         self._draft_decode_metadata = metadata
 
     def _select_decode_metadata(
@@ -1125,6 +1126,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             forward_mode=metadata_forward_mode,
         )
         self._prepare_dcp_prefill_metadata(self.forward_metadata)
+        self.forward_metadata.cache.prepare_compressed_attention_page_tables()
         if is_packed_decode:
             self.forward_decode_metadata = self.forward_metadata
             if getattr(self, "is_draft", False):
@@ -1242,6 +1244,11 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         block_size: int,
         topk_indices: torch.Tensor | None,
     ) -> DeepseekV4CompressedAttentionMetadata | None:
+        """Map C4 top-k or C128 history to attention slots for the current step.
+
+        C4 selections depend on the layer. C128 retains the original forward
+        cache and capture guard; replay executes the recorded computation.
+        """
         if compress_ratio <= 1:
             return None
         metadata = self.forward_metadata
@@ -1255,45 +1262,30 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             if metadata.is_valid_token is not None
             else None
         )
+        page_table = metadata.cache.compressed_attention_page_table(compress_ratio)
+        base_offsets = (
+            _compressed_block_table_base_offsets(metadata, compress_ratio)
+            if page_table is not metadata.cache.page_table
+            else None
+        )
+        req_idx = metadata.token_to_req_indices[:num_tokens]
         if compress_ratio == 4:
-            valid_lens = None
-            if self.dcp_size > 1:
-                lens = torch.empty(
-                    num_tokens, dtype=torch.int32, device=positions.device
-                )
-                indices_2d, valid_lens, _ = self._dcp_selected_compressed_rows(
-                    positions,
-                    compress_ratio=compress_ratio,
-                    block_size=block_size,
-                    topk_indices=topk_indices,
-                    out_scan_lens=lens,
-                )
-            else:
-                page_table = metadata.cache.compressed_page_table(
-                    compress_ratio, block_size
-                )
-                base_offsets = (
-                    _compressed_block_table_base_offsets(metadata, compress_ratio)
-                    if page_table is not metadata.cache.page_table
-                    else None
-                )
-                topk_local = topk_indices
-                if base_offsets is not None:
-                    req_idx = metadata.token_to_req_indices[:num_tokens].to(torch.int64)
-                    base_slots = base_offsets.to(
-                        device=positions.device, dtype=torch.int64
-                    )[req_idx] * int(block_size)
-                    topk_i64 = topk_indices.to(torch.int64)
-                    topk_local = torch.where(
-                        topk_i64 >= 0, topk_i64 - base_slots[:, None], topk_i64
-                    ).to(topk_indices.dtype)
-                indices_2d, lens = dsv4_compute_global_topk_indices_and_lens(
-                    topk_indices=topk_local,
-                    token_to_req_indices=metadata.token_to_req_indices[:num_tokens],
-                    block_table=page_table,
-                    block_size=block_size,
-                    is_valid_token=is_valid_token,
-                )
+            valid_lens = (
+                torch.empty(num_tokens, dtype=torch.int32, device=positions.device)
+                if self.dcp_size > 1
+                else None
+            )
+            indices_2d, lens = dsv4_compute_global_topk_indices_and_lens(
+                topk_indices=topk_indices,
+                token_to_req_indices=req_idx,
+                block_table=page_table,
+                block_size=block_size,
+                is_valid_token=is_valid_token,
+                block_table_base_offsets=base_offsets,
+                positions=positions if self.dcp_size > 1 else None,
+                compress_ratio=compress_ratio,
+                out_valid_lens=valid_lens,
+            )
             return DeepseekV4CompressedAttentionMetadata(
                 indices=indices_2d.unsqueeze(1), lens=lens, valid_lens=valid_lens
             )
@@ -1324,40 +1316,22 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         if is_valid_token is not None:
             lens = torch.where(is_valid_token, lens, 0)
 
-        valid_lens = None
-        if self.dcp_size > 1:
-            indices_2d, valid_lens, _ = self._dcp_selected_compressed_rows(
-                positions,
-                compress_ratio=compress_ratio,
-                block_size=block_size,
-                topk_indices=topk_indices,
-            )
-        else:
-            req_idx = metadata.token_to_req_indices[:num_tokens].to(torch.int64)
-            page_table = metadata.cache.compressed_page_table(
-                compress_ratio, block_size
-            )
-            base_offsets = (
-                _compressed_block_table_base_offsets(metadata, compress_ratio)
-                if page_table is not metadata.cache.page_table
-                else None
-            )
-            offsets = torch.arange(width, dtype=torch.int64, device=positions.device)
-            valid = offsets[None, :] < lens[:, None]
-            local = torch.where(valid, offsets[None, :], 0)
-            pages = torch.div(local, block_size, rounding_mode="floor")
-            if base_offsets is not None:
-                pages = (
-                    pages
-                    - base_offsets.to(device=positions.device, dtype=torch.int64)[
-                        req_idx, None
-                    ]
-                )
-            page_ids = metadata.cache.safe_page_ids(
-                page_table, req_idx[:, None], pages.long()
-            )
-            slots = page_ids * block_size + local % block_size
-            indices_2d = torch.where(valid & (page_ids >= 0), slots, -1).to(torch.int32)
+        req_idx = req_idx.to(torch.int64)
+        offsets = torch.arange(width, dtype=torch.int64, device=positions.device)
+        valid = offsets[None, :] < lens[:, None]
+        local = torch.where(valid, offsets[None, :], 0)
+        pages = torch.div(local, block_size, rounding_mode="floor")
+        if base_offsets is not None:
+            # Padded queries may carry invalid request IDs. The page lookup
+            # below masks them; keep the preceding base lookup safe as well.
+            safe_req = req_idx.clamp(0, max(0, page_table.shape[0] - 1))
+            if base_offsets.numel():
+                pages -= base_offsets.to(torch.int64)[safe_req, None]
+        page_ids = metadata.cache.safe_page_ids(page_table, req_idx[:, None], pages)
+        slots = page_ids * block_size + local % block_size
+        valid &= page_ids >= 0
+        indices_2d = torch.where(valid, slots, -1).to(torch.int32)
+        valid_lens = valid.sum(dim=1, dtype=torch.int32) if self.dcp_size > 1 else None
         result = DeepseekV4CompressedAttentionMetadata(
             indices=indices_2d.unsqueeze(1), lens=lens, valid_lens=valid_lens
         )
@@ -2235,6 +2209,10 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 if cache_metadata.indexer_state_base_logical_page is not None
                 else None
             ),
+            compressed_attention_page_tables={
+                group_id: table[req_start:req_end]
+                for group_id, table in cache_metadata.compressed_attention_page_tables.items()
+            },
         )
         return DeepseekV4ForwardMetadata(
             req_pool_indices=metadata.req_pool_indices[req_start:req_end],
@@ -2729,6 +2707,11 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             indexer_state_block_table=indexer_state_block_table,
             indexer_state_base_logical_page=indexer_state_base,
             decode_compressed_slot_mappings=prior_slot_mappings,
+            compressed_attention_page_tables=(
+                prior_metadata.cache.compressed_attention_page_tables
+                if prior_metadata is not None
+                else {}
+            ),
         )
         metadata = prior_metadata
         if metadata is None:
@@ -2756,7 +2739,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             metadata.query_lens_cpu = None
             metadata.forward_mode = metadata_forward_mode
         self._cuda_graph_metadata[bs] = metadata
-        metadata.attention.clear_compressed_cache()
+        metadata.cache.prepare_compressed_attention_page_tables()
         if is_packed_decode and getattr(self, "is_draft", False):
             self._prepare_draft_decode_metadata(
                 metadata,
@@ -2919,10 +2902,13 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             decode_compressed_slot_mappings=(
                 metadata.cache.decode_compressed_slot_mappings
             ),
+            compressed_attention_page_tables=(
+                metadata.cache.compressed_attention_page_tables
+            ),
         )
         metadata.num_prefill_reqs = 0
         metadata.num_prefill_tokens = 0
-        metadata.attention.clear_compressed_cache()
+        metadata.cache.prepare_compressed_attention_page_tables()
         if is_packed_decode and getattr(self, "is_draft", False):
             self._prepare_draft_decode_metadata(
                 metadata,
@@ -2988,7 +2974,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             max_context_len=self.context_len,
         )
         _refresh_decode_indexer_schedule_metadata(metadata)
-        metadata.attention.clear_compressed_cache()
+        metadata.cache.prepare_compressed_attention_page_tables()
         self.forward_decode_metadata = metadata
         self.forward_metadata = metadata
 

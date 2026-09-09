@@ -34,6 +34,7 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
     V4_KERNEL_BLOCK_ROWS,
     V4_SWA_KV_GROUP_ID,
     DeepseekV4CacheLayout,
+    parse_v4_compressed_kv_group_id,
     parse_v4_compressor_state_group_id,
     v4_compressed_kv_group_id,
     v4_compressed_rows_per_page,
@@ -214,6 +215,51 @@ class DeepseekV4CacheMetadata:
     decode_compressed_slot_mappings: dict[tuple[int | str, int], torch.Tensor] = field(
         default_factory=dict
     )
+    # Attention reads physical pages; writers and the indexer keep their own
+    # original tables. Reuse these outputs when refreshing CUDA graph inputs.
+    compressed_attention_page_tables: dict[str, torch.Tensor] = field(
+        default_factory=dict
+    )
+
+    def prepare_compressed_attention_page_tables(self) -> None:
+        """Refresh DCP read tables in place, marking nonlocal pages with -1."""
+        if self.dcp_size == 1:
+            return
+        assert self.runtime_contract is not None
+        for group_id, table in self.block_tables.items():
+            if parse_v4_compressed_kv_group_id(group_id) is None:
+                continue
+            out = self.compressed_attention_page_tables.get(group_id)
+            if out is not None and (
+                out.shape != table.shape
+                or out.dtype != table.dtype
+                or out.device != table.device
+            ):
+                out = None
+            if out is None:
+                # Replay setup may run outside the warmup inference context.
+                with torch.inference_mode(False):
+                    out = torch.empty_like(table, memory_format=torch.contiguous_format)
+            local, owned = virtual_slots_to_local(
+                table,
+                rows_per_page=1,
+                virtual_block_count=self.runtime_contract.virtual_block_counts[
+                    group_id
+                ],
+                degree=self.dcp_size,
+                rank=self.dcp_rank,
+                out=out,
+            )
+            local.masked_fill_(~owned, -1)
+            self.compressed_attention_page_tables[group_id] = local
+
+    def compressed_attention_page_table(self, compress_ratio: int) -> torch.Tensor:
+        """Return the prepared physical read table for a compressed KV group."""
+        if self.dcp_size == 1:
+            return self.compressed_page_table(compress_ratio)
+        return self.compressed_attention_page_tables[
+            v4_compressed_kv_group_id(compress_ratio)
+        ]
 
     def compressed_page_table(
         self,
