@@ -40,8 +40,8 @@ def _normalize_dcp_partials_kernel(
     DIM: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    token = tl.program_id(0)
-    head = tl.program_id(1)
+    token = tl.program_id(0).to(tl.int64)
+    head = tl.program_id(1).to(tl.int64)
     nonempty = tl.load(swa_lens + token) > 0
     if extra_lens is not None:
         nonempty = nonempty | (tl.load(extra_lens + token) > 0)
@@ -50,7 +50,7 @@ def _normalize_dcp_partials_kernel(
         normalized_lse + token * HEADS + head, tl.where(nonempty, value, -float("inf"))
     )
     if not nonempty:
-        offsets = tl.arange(0, BLOCK)
+        offsets = tl.arange(0, BLOCK).to(tl.int64)
         tl.store(output + token * OS_T + head * OS_H + offsets * OS_D, 0, offsets < DIM)
 
 
@@ -63,25 +63,49 @@ def normalize_dcp_partials(
     """Normalize empty attention partials for the runtime DCP combine.
 
     Args:
-        output: CUDA partials [tokens, heads, dim], updated in place only for
-            empty selections. Nonempty values (including NaNs) are preserved.
+        output: FP16/BF16/FP32 CUDA partials [tokens, heads, dim], possibly
+            strided, updated in place only for empty selections. Nonempty
+            values (including NaNs) are preserved.
         lse: Natural-log FP32 [tokens, heads], possibly strided.
-        swa_lens: Int32 valid SWA lengths [tokens].
+        swa_lens: Int32 valid SWA lengths [tokens], possibly noncontiguous.
         extra_lens: Optional int32 local valid compressed counts [tokens].
             These exclude masked holes, unlike the attention scan lengths.
+            Noncontiguous length vectors are copied to contiguous storage.
 
     Returns:
         The input output tensor, and contiguous FP32 LSE. Empty rows become
         output=0 and LSE=-inf; nonempty rows retain their original bits.
     """
+    if output.ndim != 3 or lse.ndim != 2 or lse.shape != output.shape[:2]:
+        raise ValueError("DCP normalization shapes disagree")
+    if output.shape[-1] <= 0:
+        raise ValueError("DCP normalization requires a positive head dimension")
+    if (
+        output.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+        or lse.dtype != torch.float32
+    ):
+        raise TypeError("DCP normalization requires floating partials and FP32 LSE")
+    if not output.is_cuda or lse.device != output.device:
+        raise ValueError("DCP normalization requires tensors on one CUDA device")
+    for name, lengths in (("swa_lens", swa_lens), ("extra_lens", extra_lens)):
+        if lengths is None and name == "extra_lens":
+            continue
+        if lengths.shape != (output.shape[0],):
+            raise ValueError(f"{name} must have shape [tokens]")
+        if lengths.dtype != torch.int32:
+            raise TypeError(f"{name} must be int32")
+        if lengths.device != output.device:
+            raise ValueError(f"{name} must be on the partials device")
     normalized = torch.empty(
         output.shape[:2], dtype=torch.float32, device=output.device
     )
+    if normalized.numel() == 0:
+        return output, normalized
     _normalize_dcp_partials_kernel[(output.shape[0], output.shape[1])](
         output,
         lse,
-        swa_lens,
-        extra_lens,
+        swa_lens.contiguous(),
+        extra_lens.contiguous() if extra_lens is not None else None,
         normalized,
         *output.stride(),
         *lse.stride(),
@@ -112,9 +136,9 @@ def _dcp_weight_kernel(
     BLOCK: tl.constexpr,
     SHARDS: tl.constexpr,
 ):
-    token = tl.program_id(0)
-    head = tl.program_id(1)
-    shards = tl.arange(0, SHARDS)
+    token = tl.program_id(0).to(tl.int64)
+    head = tl.program_id(1).to(tl.int64)
+    shards = tl.arange(0, SHARDS).to(tl.int64)
     lse = tl.load(
         all_lse + shards * ls_r + token * ls_t + head * ls_h,
         shards < DEGREE,
@@ -125,12 +149,13 @@ def _dcp_weight_kernel(
     safe_max = tl.where(maximum == -float("inf"), 0.0, maximum)
     mass = tl.exp(lse - safe_max)
     denominator = tl.sum(mass, 0)
-    local_lse = tl.load(all_lse + RANK * ls_r + token * ls_t + head * ls_h)
+    rank = tl.full((), RANK, tl.int64)
+    local_lse = tl.load(all_lse + rank * ls_r + token * ls_t + head * ls_h)
     weight = tl.exp(local_lse - safe_max) / tl.maximum(
         denominator, 1.1754943508222875e-38
     )
     weight = tl.where(has_nan, float("nan"), weight)
-    offsets = tl.arange(0, BLOCK)
+    offsets = tl.arange(0, BLOCK).to(tl.int64)
     values = tl.load(
         output + token * os_t + head * os_h + offsets * os_d, offsets < DIM, other=0
     ).to(tl.float32)
@@ -164,9 +189,9 @@ def _dcp_sink_kernel(
     DIM: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    token = tl.program_id(0)
-    head = tl.program_id(1)
-    offsets = tl.arange(0, BLOCK)
+    token = tl.program_id(0).to(tl.int64)
+    head = tl.program_id(1).to(tl.int64)
+    offsets = tl.arange(0, BLOCK).to(tl.int64)
     normalizer = tl.load(lse + token * ls_t + head * ls_h)
     sink_logit = tl.load(sink + head).to(tl.float32)
     factor = tl.where(

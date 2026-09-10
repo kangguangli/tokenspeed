@@ -1212,7 +1212,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         if metadata is None:
             raise RuntimeError("DeepSeek V4 decode requires forward metadata")
         num_tokens = positions.numel()
-        req_idx = metadata.token_to_req_indices[:num_tokens].to(torch.int64)
         page_table = (
             metadata.cache.compressed_attention_page_table(compress_ratio)
             if self.dcp_size > 1
@@ -1228,47 +1227,26 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             if metadata.is_valid_token is not None
             else None
         )
-        capturing = positions.is_cuda and torch.cuda.is_current_stream_capturing()
         if compress_ratio == 4:
             if topk_indices is None:
                 raise RuntimeError("DeepSeek V4 CSA decode requires top-k indices")
-            if self.dcp_size > 1:
-                valid_lens = torch.empty(
-                    num_tokens, dtype=torch.int32, device=positions.device
-                )
-                indices_2d, lens = dsv4_compute_global_topk_indices_and_lens(
-                    topk_indices=topk_indices,
-                    token_to_req_indices=metadata.token_to_req_indices[:num_tokens],
-                    block_table=page_table,
-                    block_size=block_size,
-                    is_valid_token=is_valid_token,
-                    block_table_base_offsets=block_table_base_offsets,
-                    positions=positions,
-                    compress_ratio=compress_ratio,
-                    out_valid_lens=valid_lens,
-                )
-                return indices_2d.unsqueeze(1), lens, valid_lens
-            topk_local = topk_indices
-            if block_table_base_offsets is not None:
-                base_slots = block_table_base_offsets.to(
-                    device=topk_indices.device,
-                    dtype=torch.int64,
-                )[req_idx] * int(block_size)
-                topk_i64 = topk_indices.to(torch.int64)
-                topk_local = torch.where(
-                    topk_i64 >= 0,
-                    topk_i64 - base_slots[:, None],
-                    topk_i64,
-                ).to(topk_indices.dtype)
+            valid_lens = (
+                torch.empty(num_tokens, dtype=torch.int32, device=positions.device)
+                if self.dcp_size > 1
+                else None
+            )
             indices_2d, lens = dsv4_compute_global_topk_indices_and_lens(
-                topk_indices=topk_local,
+                topk_indices=topk_indices,
                 token_to_req_indices=metadata.token_to_req_indices[:num_tokens],
                 block_table=page_table,
                 block_size=block_size,
                 is_valid_token=is_valid_token,
+                block_table_base_offsets=block_table_base_offsets,
+                out_valid_lens=valid_lens,
             )
-            return indices_2d.unsqueeze(1), lens, None
+            return indices_2d.unsqueeze(1), lens, valid_lens
 
+        capturing = positions.is_cuda and torch.cuda.is_current_stream_capturing()
         cache_key = (
             int(compress_ratio),
             int(block_size),
@@ -1304,6 +1282,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 torch.zeros_like(lens),
             )
 
+        req_idx = metadata.token_to_req_indices[:num_tokens].to(torch.int64)
         safe_local = torch.where(valid, local, torch.zeros_like(local))
         pages = torch.div(safe_local, block_size, rounding_mode="floor")
         if block_table_base_offsets is not None:

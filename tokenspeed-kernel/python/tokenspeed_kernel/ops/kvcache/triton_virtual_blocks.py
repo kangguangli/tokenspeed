@@ -47,7 +47,7 @@ def _translate_virtual_slots(
     RANK: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     active = offsets < count
     raw = tl.load(source + offsets, mask=active, other=0).to(tl.int64)
     safe = tl.maximum(raw, 0)
