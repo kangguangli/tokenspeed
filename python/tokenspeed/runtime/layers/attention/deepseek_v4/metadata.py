@@ -94,15 +94,6 @@ class DeepseekV4IndexerBatchMetadata:
 
 
 @dataclass
-class DeepseekV4CompressedAttentionMetadata:
-    indices: torch.Tensor
-    # Scan lengths precede owner masking and have equal values across layers.
-    lens: torch.Tensor
-    # Actual local counts are needed to normalize empty DCP partials.
-    valid_lens: torch.Tensor | None = None
-
-
-@dataclass
 class DeepseekV4AttentionMetadata:
     decode_swa_indices: torch.Tensor | None = None
     decode_swa_lens: torch.Tensor | None = None
@@ -110,12 +101,13 @@ class DeepseekV4AttentionMetadata:
     decode_swa_window_size: int = 0
     decode_swa_block_size: int = 0
     # Only dense C128 selection is cached. C4 maps and counts top-k every layer.
-    decode_compressed_cache: dict[
-        tuple[int, int, int, int], DeepseekV4CompressedAttentionMetadata
+    decode_dense_compressed_indices_cache: dict[
+        tuple[int, int, int, int],
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor | None],
     ] = field(default_factory=dict)
-    decode_compressed_capture_safe_keys: set[tuple[int, int, int, int]] = field(
-        default_factory=set
-    )
+    decode_dense_compressed_indices_capture_safe_keys: set[
+        tuple[int, int, int, int]
+    ] = field(default_factory=set)
 
 
 @dataclass
@@ -142,12 +134,9 @@ class DeepseekV4SparseIndexerMetadata:
 
 @dataclass
 class DeepseekV4DcpPrefillChunk:
-    slots: torch.Tensor
+    local_destinations: torch.Tensor
     counts: list[int]
     destinations: torch.Tensor
-    zero_destinations: torch.Tensor
-    packed_page_table: torch.Tensor
-    packed_lens: torch.Tensor
     workspace_width: int
 
 

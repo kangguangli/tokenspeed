@@ -385,7 +385,6 @@ if (
         extra_page_size: int | None = None,
         out: torch.Tensor | None = None,
         return_lse: bool = False,
-        extra_valid_lens: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if return_lse and attn_sink is not None:
             raise ValueError("FlashMLA DCP partials must omit the sink")
@@ -438,24 +437,15 @@ if (
         if return_lse:
             # FlashMLA reports natural-log LSE excluding the sink. Its usual
             # sink-scaled output would not be a compatible partial, hence the
-            # explicit no-sink gate above. Empty shards have a defined state.
-            lse = lse.squeeze(-1).float()
-            if lse.shape != result.shape[:-1]:
+            # explicit no-sink gate above. DCP owns empty-shard normalization
+            # and removing the singleton query axis from [tokens, heads, 1].
+            assert lse.dtype == torch.float32, "FlashMLA must return FP32 LSE"
+            if lse.shape != (*result.shape[:-1], 1):
                 raise ValueError("FlashMLA DCP LSE shape disagrees with output")
-            from tokenspeed_kernel.ops.attention.triton.dcp import (
-                normalize_dcp_partials,
-            )
-
-            result, lse = normalize_dcp_partials(
-                result,
-                lse,
-                swa_lens,
-                extra_lens if extra_valid_lens is None else extra_valid_lens,
-            )
         if out is not None:
             out.copy_(result)
             result = out
-        return (result, lse.contiguous()) if return_lse else result
+        return (result, lse) if return_lse else result
 
 
 if (

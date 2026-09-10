@@ -3743,7 +3743,6 @@ def dsv4_decode(
     override: str | None = None,
     solution: str | None = None,
     return_lse: bool = False,
-    extra_valid_lens: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run DeepSeek V4 selected attention over page-planar FP8 caches.
 
@@ -3783,15 +3782,12 @@ def dsv4_decode(
         solution: Optional registered solution name.
         return_lse: Return a no-sink partial and its natural-log LSE. Requires
             attn_sink=None and an explicitly compatible kernel.
-        extra_valid_lens: Optional count of nonnegative extra slots within each
-            scanned prefix, as contiguous int32 [tokens]. Supply it with
-            return_lse=True when extra_lens includes masked holes, so an empty
-            local selection is normalized correctly. This count does not affect scheduling.
-
     Returns:
         BF16 attention output shaped like ``q``. With return_lse=True, also
-        return FP32 LSE shaped [tokens, heads]; empty selections have output
-        zero and LSE -inf. Sink scaling is never included in these partials.
+        return natural-log FP32 LSE shaped [tokens, heads, 1], with one query
+        per token. Sink scaling is never included in these partials. Empty
+        selection values are backend-defined; the DCP caller uses actual local
+        valid counts to normalize them to output=0 and LSE=-inf before merging.
     """
     if q.dim() != 3 or q.shape[0] < 1 or q.shape[-1] != 512:
         raise ValueError(
@@ -3850,17 +3846,6 @@ def dsv4_decode(
             for tensor in (extra_kv_cache, extra_slots, extra_lens)
         ):
             raise ValueError("all extra selected-attention tensors must share a device")
-    if extra_valid_lens is not None:
-        if not return_lse or extra_lens is None:
-            raise ValueError(
-                "extra_valid_lens requires an extra segment and return_lse"
-            )
-        if extra_valid_lens.shape != (tokens,) or not extra_valid_lens.is_contiguous():
-            raise ValueError(
-                "extra_valid_lens must be contiguous with one entry per query token"
-            )
-        if extra_valid_lens.dtype != torch.int32 or extra_valid_lens.device != q.device:
-            raise ValueError("extra_valid_lens must be int32 on the query device")
     if out is not None and (
         out.shape != q.shape or out.dtype != q.dtype or out.device != q.device
     ):
@@ -3949,11 +3934,6 @@ def dsv4_decode(
             extra_page_size=extra_page_size,
             out=out,
             **({"return_lse": True} if return_lse else {}),
-            **(
-                {"extra_valid_lens": extra_valid_lens}
-                if extra_valid_lens is not None
-                else {}
-            ),
         )
 
 

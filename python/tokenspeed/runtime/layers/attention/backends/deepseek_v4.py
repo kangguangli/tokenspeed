@@ -29,6 +29,7 @@ from tokenspeed_kernel import (
     dsv4_prefill,
     dsv4_reset_attention_state,
 )
+from tokenspeed_kernel.ops.attention.triton.dcp import normalize_dcp_partials
 from tokenspeed_kernel.ops.attention.triton.dsv4 import (
     dsv4_build_dense_prefill_local_compressed_indices,
     dsv4_combine_dense_swa_indices,
@@ -37,11 +38,9 @@ from tokenspeed_kernel.ops.attention.triton.dsv4 import (
     dsv4_decode_swa_indices_and_lens,
     dsv4_dequantize_and_gather_k_cache,
     dsv4_indexer_decode_metadata_compute,
-    dsv4_pack_cache_rows,
 )
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
-from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
 from tokenspeed.runtime.distributed.comm_ops import token_all_gather
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
@@ -52,7 +51,6 @@ from tokenspeed.runtime.layers.attention.dcp.comm import (
     gather_query_heads,
 )
 from tokenspeed.runtime.layers.attention.deepseek_v4.metadata import (
-    DeepseekV4CompressedAttentionMetadata,
     DeepseekV4DcpPrefillChunk,
     DeepseekV4ForwardMetadata,
 )
@@ -301,7 +299,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self.dcp_size = getattr(config, "dcp_size", 1)
         self.dcp_rank = getattr(config, "dcp_rank", 0)
         self.dcp_group = getattr(config, "dcp_group", ())
-        self.dcp_comm_backend = getattr(config, "dcp_comm_backend", "auto")
         # Per-sliding-group [max_bs] int32 buffers mirroring the block-table
         # buffers; populated by init_cuda_graph_state.
         self._cuda_graph_block_table_base_offsets: dict[str, torch.Tensor] = {}
@@ -309,9 +306,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self._prefill_workspace_buffer: torch.Tensor | None = None
         self._prefill_workspace_rows = 0
         self._prefill_workspace_head_dim = 0
-        # Byte collectives must not select the BF16-only token RSAG backend.
-        self._dcp_prefill_comm = NcclBackend()
-        self._dcp_prefill_dequantized: torch.Tensor | None = None
         self._prefill_dense_compressed_indices_buffer: torch.Tensor | None = None
         self._decode_swa_window_size = 0
         self._decode_swa_block_size = 0
@@ -1232,109 +1226,146 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self._decode_swa_block_size = block_size
         return indices, lens
 
-    def _get_decode_compressed_metadata(
+    def _decode_compressed_attention_indices_and_lens(
         self,
         positions: torch.Tensor,
         *,
         compress_ratio: int,
         block_size: int,
         topk_indices: torch.Tensor | None,
-    ) -> DeepseekV4CompressedAttentionMetadata | None:
-        """Map C4 top-k or C128 history to attention slots for the current step.
-
-        C4 selections depend on the layer. C128 retains the original forward
-        cache and capture guard; replay executes the recorded computation.
-        """
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
         if compress_ratio <= 1:
-            return None
+            return None, None, None
         metadata = self.forward_metadata
         if metadata is None:
             raise RuntimeError("DeepSeek V4 decode requires forward metadata")
-        if compress_ratio == 4 and topk_indices is None:
-            raise RuntimeError("DeepSeek V4 CSA decode requires top-k indices")
         num_tokens = positions.numel()
+        req_idx = metadata.token_to_req_indices[:num_tokens].to(torch.int64)
+        page_table = (
+            metadata.cache.compressed_attention_page_table(compress_ratio)
+            if self.dcp_size > 1
+            else metadata.cache.compressed_page_table(compress_ratio, block_size)
+        )
+        block_table_base_offsets = (
+            _compressed_block_table_base_offsets(metadata, compress_ratio)
+            if page_table is not metadata.cache.page_table
+            else None
+        )
         is_valid_token = (
             metadata.is_valid_token[:num_tokens]
             if metadata.is_valid_token is not None
             else None
         )
-        page_table = metadata.cache.compressed_attention_page_table(compress_ratio)
-        base_offsets = (
-            _compressed_block_table_base_offsets(metadata, compress_ratio)
-            if page_table is not metadata.cache.page_table
-            else None
-        )
-        req_idx = metadata.token_to_req_indices[:num_tokens]
+        capturing = positions.is_cuda and torch.cuda.is_current_stream_capturing()
         if compress_ratio == 4:
-            valid_lens = (
-                torch.empty(num_tokens, dtype=torch.int32, device=positions.device)
-                if self.dcp_size > 1
-                else None
-            )
+            if topk_indices is None:
+                raise RuntimeError("DeepSeek V4 CSA decode requires top-k indices")
+            if self.dcp_size > 1:
+                valid_lens = torch.empty(
+                    num_tokens, dtype=torch.int32, device=positions.device
+                )
+                indices_2d, lens = dsv4_compute_global_topk_indices_and_lens(
+                    topk_indices=topk_indices,
+                    token_to_req_indices=metadata.token_to_req_indices[:num_tokens],
+                    block_table=page_table,
+                    block_size=block_size,
+                    is_valid_token=is_valid_token,
+                    block_table_base_offsets=block_table_base_offsets,
+                    positions=positions,
+                    compress_ratio=compress_ratio,
+                    out_valid_lens=valid_lens,
+                )
+                return indices_2d.unsqueeze(1), lens, valid_lens
+            topk_local = topk_indices
+            if block_table_base_offsets is not None:
+                base_slots = block_table_base_offsets.to(
+                    device=topk_indices.device,
+                    dtype=torch.int64,
+                )[req_idx] * int(block_size)
+                topk_i64 = topk_indices.to(torch.int64)
+                topk_local = torch.where(
+                    topk_i64 >= 0,
+                    topk_i64 - base_slots[:, None],
+                    topk_i64,
+                ).to(topk_indices.dtype)
             indices_2d, lens = dsv4_compute_global_topk_indices_and_lens(
-                topk_indices=topk_indices,
-                token_to_req_indices=req_idx,
+                topk_indices=topk_local,
+                token_to_req_indices=metadata.token_to_req_indices[:num_tokens],
                 block_table=page_table,
                 block_size=block_size,
                 is_valid_token=is_valid_token,
-                block_table_base_offsets=base_offsets,
-                positions=positions if self.dcp_size > 1 else None,
-                compress_ratio=compress_ratio,
-                out_valid_lens=valid_lens,
             )
-            return DeepseekV4CompressedAttentionMetadata(
-                indices=indices_2d.unsqueeze(1), lens=lens, valid_lens=valid_lens
-            )
+            return indices_2d.unsqueeze(1), lens, None
 
         cache_key = (
             int(compress_ratio),
             int(block_size),
             int(num_tokens),
-            int(positions.data_ptr()) if num_tokens else 0,
+            int(positions.data_ptr()) if positions.numel() else 0,
         )
-        attention = metadata.attention
-        cache = attention.decode_compressed_cache
-        capture_safe_keys = attention.decode_compressed_capture_safe_keys
-        capturing = positions.is_cuda and torch.cuda.is_current_stream_capturing()
-        cached = cache.get(cache_key)
-        if capturing and cache_key not in capture_safe_keys:
-            # Warmup tensors cannot replace computations that replay must run.
-            cached = None
-        if cached is not None:
+        attention_metadata = metadata.attention
+        dense_indices_cache = attention_metadata.decode_dense_compressed_indices_cache
+        capture_safe_keys = (
+            attention_metadata.decode_dense_compressed_indices_capture_safe_keys
+        )
+        cached = dense_indices_cache.get(cache_key)
+        capture_cached = cache_key in capture_safe_keys
+        if cached is not None and (not capturing or capture_cached):
             return cached
 
         width = self._dense_compressed_indices_width(compress_ratio)
-        lens = (
-            torch.div(positions + 1, compress_ratio, rounding_mode="floor")
-            .clamp(0, width)
-            .to(torch.int32)
-        )
-        if is_valid_token is not None:
-            lens = torch.where(is_valid_token, lens, 0)
-
-        req_idx = req_idx.to(torch.int64)
+        compressed_lens = torch.div(
+            positions.to(torch.int64) + 1,
+            compress_ratio,
+            rounding_mode="floor",
+        ).clamp(0, width)
         offsets = torch.arange(width, dtype=torch.int64, device=positions.device)
-        valid = offsets[None, :] < lens[:, None]
-        local = torch.where(valid, offsets[None, :], 0)
-        pages = torch.div(local, block_size, rounding_mode="floor")
-        if base_offsets is not None:
-            # Padded queries may carry invalid request IDs. The page lookup
-            # below masks them; keep the preceding base lookup safe as well.
-            safe_req = req_idx.clamp(0, max(0, page_table.shape[0] - 1))
-            if base_offsets.numel():
-                pages -= base_offsets.to(torch.int64)[safe_req, None]
-        page_ids = metadata.cache.safe_page_ids(page_table, req_idx[:, None], pages)
-        slots = page_ids * block_size + local % block_size
-        valid &= page_ids >= 0
-        indices_2d = torch.where(valid, slots, -1).to(torch.int32)
-        valid_lens = valid.sum(dim=1, dtype=torch.int32) if self.dcp_size > 1 else None
-        result = DeepseekV4CompressedAttentionMetadata(
-            indices=indices_2d.unsqueeze(1), lens=lens, valid_lens=valid_lens
+        local = offsets[None, :].expand(num_tokens, -1)
+        valid = offsets[None, :] < compressed_lens[:, None]
+        if is_valid_token is not None:
+            valid = valid & is_valid_token.to(torch.bool)[:, None]
+        lens = compressed_lens.to(torch.int32)
+        if is_valid_token is not None:
+            lens = torch.where(
+                is_valid_token.to(torch.bool),
+                lens,
+                torch.zeros_like(lens),
+            )
+
+        safe_local = torch.where(valid, local, torch.zeros_like(local))
+        pages = torch.div(safe_local, block_size, rounding_mode="floor")
+        if block_table_base_offsets is not None:
+            pages = (
+                pages
+                - block_table_base_offsets.to(
+                    device=pages.device,
+                    dtype=torch.int64,
+                )[
+                    req_idx
+                ][:, None]
+            )
+        page_offsets = safe_local % block_size
+        page_ids = metadata.cache.safe_page_ids(
+            page_table,
+            req_idx[:, None],
+            pages.long(),
         )
-        cache[cache_key] = result
+        slots = page_ids * block_size + page_offsets
+        indices_2d = torch.where(
+            valid & (page_ids >= 0),
+            slots,
+            torch.full_like(slots, -1),
+        )
+        indices = indices_2d.to(torch.int32).unsqueeze(1)
+        valid_lens = (
+            (valid & (page_ids >= 0)).sum(dim=1, dtype=torch.int32)
+            if self.dcp_size > 1
+            else None
+        )
+        dense_indices_cache[cache_key] = (indices, lens, valid_lens)
         if capturing:
             capture_safe_keys.add(cache_key)
-        return result
+        return indices, lens, valid_lens
 
     def _dense_compressed_indices_width(self, compress_ratio: int) -> int:
         if compress_ratio <= 1:
@@ -1409,130 +1440,74 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 f"metadata_tokens={metadata.token_to_req_indices.numel()}, "
                 f"q_tokens={q.shape[0]}"
             )
-        if self.dcp_size > 1 and compress_ratio > 1:
-            return self._forward_dcp_decode(
-                q=q[:, :num_local_heads],
-                positions=positions,
-                token_to_kv_pool=token_to_kv_pool,
-                layer_id=layer_id,
-                compress_ratio=compress_ratio,
-                padded_heads=padded_heads,
-                window_size=window_size,
-                softmax_scale=softmax_scale,
-                attn_sink=attn_sink,
-                topk_indices=topk_indices,
-            )
-        if q.shape[1] == padded_heads:
+        use_dcp = self.dcp_size > 1 and compress_ratio > 1
+        if use_dcp:
+            q = gather_query_heads(q, self.dcp_group)
+        actual_heads = q.shape[1]
+        kernel_heads = max(padded_heads, actual_heads)
+        if actual_heads == kernel_heads:
             q_padded = q.contiguous()
         else:
             q_padded = torch.zeros(
-                (q.shape[0], padded_heads, q.shape[2]),
+                (q.shape[0], kernel_heads, q.shape[2]),
                 dtype=q.dtype,
                 device=q.device,
             )
-            q_padded[:, : q.shape[1]].copy_(q)
+            q_padded[:, :actual_heads].copy_(q)
         swa_block_size = token_to_kv_pool.swa_block_size
         swa_indices, swa_lens = self._get_decode_swa_metadata(
             metadata, window_size=window_size, block_size=swa_block_size
         )
-        compressed_block_size = token_to_kv_pool.get_compressed_block_size(layer_id)
-        compressed = self._get_decode_compressed_metadata(
-            positions,
-            compress_ratio=compress_ratio,
-            block_size=compressed_block_size,
-            topk_indices=topk_indices,
-        )
-
-        compressed_cache_2d = None
-        if compress_ratio > 1:
-            compressed_cache_2d = token_to_kv_pool.get_compressed_kv_buffer_2d(layer_id)
-
-        out = dsv4_decode(
-            q=q_padded,
-            swa_kv_cache=token_to_kv_pool.get_swa_kv_buffer(layer_id),
-            swa_slots=swa_indices,
-            swa_lens=swa_lens,
-            swa_page_size=swa_block_size,
-            attn_sink=attn_sink,
-            softmax_scale=softmax_scale,
-            extra_kv_cache=compressed_cache_2d,
-            extra_slots=compressed.indices if compressed is not None else None,
-            extra_lens=compressed.lens if compressed is not None else None,
-            extra_page_size=(
-                compressed_block_size if compressed_cache_2d is not None else None
-            ),
-        )
-        return out[:, :num_local_heads]
-
-    def _forward_dcp_decode(
-        self,
-        *,
-        q: torch.Tensor,
-        positions: torch.Tensor,
-        token_to_kv_pool,
-        layer_id: int,
-        compress_ratio: int,
-        padded_heads: int,
-        window_size: int,
-        softmax_scale: float,
-        attn_sink: torch.Tensor,
-        topk_indices: torch.Tensor | None,
-    ) -> torch.Tensor:
-        metadata = self.forward_metadata
-        assert metadata is not None
-        swa_slots, swa_lens = self._get_decode_swa_metadata(
-            metadata,
-            window_size=window_size,
-            block_size=token_to_kv_pool.swa_block_size,
-        )
-        # SWA is replicated. Count it on exactly one context shard.
+        # SWA is replicated. Only one context shard counts it in compressed layers.
         local_swa_lens = swa_lens
-        if self.dcp_rank != 0:
+        if use_dcp and self.dcp_rank != 0:
             zero_lens = metadata.attention.decode_dcp_zero_swa_lens
             if zero_lens is None or zero_lens.shape != swa_lens.shape:
                 zero_lens = torch.zeros_like(swa_lens)
                 metadata.attention.decode_dcp_zero_swa_lens = zero_lens
             local_swa_lens = zero_lens
-        rows = token_to_kv_pool.get_compressed_block_size(layer_id)
-        compressed = self._get_decode_compressed_metadata(
-            positions,
-            compress_ratio=compress_ratio,
-            block_size=rows,
-            topk_indices=topk_indices,
-        )
-        assert compressed is not None
-        gathered_q = gather_query_heads(q, self.dcp_group)
-        actual_heads = gathered_q.shape[1]
-        kernel_heads = max(padded_heads, actual_heads)
-        if actual_heads < kernel_heads:
-            kernel_q = torch.nn.functional.pad(
-                gathered_q, (0, 0, 0, kernel_heads - actual_heads)
+        compressed_block_size = token_to_kv_pool.get_compressed_block_size(layer_id)
+        extra_indices, extra_lens, valid_lens = (
+            self._decode_compressed_attention_indices_and_lens(
+                positions,
+                compress_ratio=compress_ratio,
+                block_size=compressed_block_size,
+                topk_indices=topk_indices,
             )
-        else:
-            kernel_q = gathered_q
-        partial, lse = dsv4_decode(
-            q=kernel_q,
+        )
+        compressed_cache_2d = None
+        if compress_ratio > 1:
+            compressed_cache_2d = token_to_kv_pool.get_compressed_kv_buffer_2d(layer_id)
+
+        result = dsv4_decode(
+            q=q_padded,
             swa_kv_cache=token_to_kv_pool.get_swa_kv_buffer(layer_id),
-            swa_slots=swa_slots,
+            swa_slots=swa_indices,
             swa_lens=local_swa_lens,
-            swa_page_size=token_to_kv_pool.swa_block_size,
-            attn_sink=None,
+            swa_page_size=swa_block_size,
+            attn_sink=None if use_dcp else attn_sink,
             softmax_scale=softmax_scale,
-            extra_kv_cache=token_to_kv_pool.get_compressed_kv_buffer_2d(layer_id),
-            extra_slots=compressed.indices,
-            extra_lens=compressed.lens,
-            extra_valid_lens=compressed.valid_lens,
-            extra_page_size=rows,
-            return_lse=True,
+            extra_kv_cache=compressed_cache_2d,
+            extra_slots=extra_indices,
+            extra_lens=extra_lens,
+            extra_page_size=(
+                compressed_block_size if compressed_cache_2d is not None else None
+            ),
+            **({"return_lse": True} if use_dcp else {}),
         )
-        return combine_attention_partials(
-            partial[:, :actual_heads],
-            lse[:, :actual_heads],
-            group=self.dcp_group,
-            rank=self.dcp_rank,
-            sink=attn_sink,
-            method=self.dcp_comm_backend,
-        )
+        if use_dcp:
+            partial, lse = result
+            partial, lse = normalize_dcp_partials(
+                partial, lse.squeeze(-1), local_swa_lens, valid_lens
+            )
+            return combine_attention_partials(
+                partial[:, :actual_heads],
+                lse[:, :actual_heads],
+                group=self.dcp_group,
+                rank=self.dcp_rank,
+                sink=attn_sink,
+            )
+        return result[:, :num_local_heads]
 
     def forward_deepseek_v4_mixed(
         self,
@@ -1695,7 +1670,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             )
             width = max(1, swa_width + compressed_width)
             destinations = [[] for _ in range(degree)]
-            local_slots, zero_destinations = [], []
             for req in range(start, end):
                 request_base = (req - start) * width
                 for entry_start in range(0, row_counts[req], rows_per_page):
@@ -1709,27 +1683,14 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                         entry_start, min(entry_start + rows_per_page, row_counts[req])
                     )
                     if not 0 < virtual < virtual_count:
-                        zero_destinations.extend(request_base + e for e in entries)
                         continue
                     owner = (virtual - 1) % degree
                     destinations[owner].extend(request_base + e for e in entries)
-                    if owner == rank:
-                        local_page = (virtual - 1) // degree + 1
-                        local_slots.extend(
-                            local_page * rows_per_page + e % rows_per_page
-                            for e in entries
-                        )
             counts = [len(rows) for rows in destinations]
-            total_rows = sum(counts)
             chunks[start, end] = DeepseekV4DcpPrefillChunk(
-                slots=tensor(local_slots),
+                local_destinations=tensor(destinations[rank]),
                 counts=counts,
                 destinations=tensor([row for rows in destinations for row in rows]),
-                zero_destinations=tensor(zero_destinations),
-                packed_page_table=torch.arange(
-                    total_rows, dtype=torch.int32, device=device
-                )[None],
-                packed_lens=tensor([total_rows], torch.int32),
                 workspace_width=width,
             )
         return chunks
@@ -1750,21 +1711,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 chunk_size=self.prefill_chunk_size,
                 window_size=self.swa_storage_rows,
             )
-        rows = max(
-            (
-                chunk.destinations.numel()
-                for plan in metadata.dcp_prefill.values()
-                for chunk in plan.values()
-            ),
-            default=0,
-        )
-        if rows and (
-            self._dcp_prefill_dequantized is None
-            or self._dcp_prefill_dequantized.shape[0] < rows
-        ):
-            self._dcp_prefill_dequantized = torch.empty(
-                (rows, self.head_dim), dtype=torch.bfloat16, device=self.device
-            )
 
     def _gather_compressed_prefill(
         self,
@@ -1780,47 +1726,38 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         block_table_base_offsets: torch.Tensor | None = None,
         max_gather_len: int | None = None,
     ) -> None:
-        """Gather prefix and newly computed KV together in their original bytes."""
-        if self.dcp_size == 1:
-            dsv4_dequantize_and_gather_k_cache(
-                out=out,
-                cache_2d=cache_2d,
-                seq_lens=seq_lens,
-                gather_lens=gather_lens,
-                block_table=block_table,
-                block_size=block_size,
-                offset=offset,
-                block_table_base_offsets=block_table_base_offsets,
-                max_gather_len=max_gather_len,
-            )
-            return
-        metadata = self.forward_metadata
-        start = metadata.prefill_req_offset
-        chunk = metadata.dcp_prefill[compress_ratio][start, start + out.shape[0]]
-        if offset != 0 or out.shape[1] != chunk.workspace_width:
-            raise RuntimeError("DCP prefill workspace differs from its prepared layout")
-        flat_out = out.view(-1, out.shape[-1])
-        if chunk.zero_destinations.numel():
-            flat_out.index_fill_(0, chunk.zero_destinations, 0)
-        count = chunk.destinations.numel()
-        if not count:
-            return
-        local = dsv4_pack_cache_rows(cache_2d, chunk.slots, block_size)
-        packed = token_all_gather(
-            local, self.dcp_group, chunk.counts, backend=self._dcp_prefill_comm
-        )
-        decoded = self._dcp_prefill_dequantized[:count].unsqueeze(0)
+        """Dequantize local history, gather owned BF16 rows, and restore TP order."""
+        chunk = None
+        if self.dcp_size > 1:
+            metadata = self.forward_metadata
+            start = metadata.prefill_req_offset
+            chunk = metadata.dcp_prefill[compress_ratio][start, start + out.shape[0]]
+            if offset != 0 or out.shape[1] != chunk.workspace_width:
+                raise RuntimeError(
+                    "DCP prefill workspace differs from its prepared layout"
+                )
+            # This read table already maps virtual pages to local physical pages;
+            # nonowners and missing pages are -1 and dequantize to zero.
+            block_table = metadata.cache.compressed_attention_page_table(
+                compress_ratio
+            )[: seq_lens.numel()]
         dsv4_dequantize_and_gather_k_cache(
-            out=decoded,
-            cache_2d=packed,
-            seq_lens=chunk.packed_lens,
-            gather_lens=None,
-            block_table=chunk.packed_page_table,
-            block_size=1,
-            offset=0,
-            max_gather_len=count,
+            out=out,
+            cache_2d=cache_2d,
+            seq_lens=seq_lens,
+            gather_lens=gather_lens,
+            block_table=block_table,
+            block_size=block_size,
+            offset=offset,
+            block_table_base_offsets=block_table_base_offsets,
+            max_gather_len=max_gather_len,
         )
-        flat_out.index_copy_(0, chunk.destinations, decoded[0])
+        if chunk is None or not chunk.destinations.numel():
+            return
+        flat_out = out.view(-1, out.shape[-1])
+        local = flat_out.index_select(0, chunk.local_destinations)
+        gathered = token_all_gather(local, self.dcp_group, chunk.counts)
+        flat_out.index_copy_(0, chunk.destinations, gathered)
 
     def _prefill_workspace(
         self,
@@ -2863,7 +2800,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             or self._draft_decode_metadata is None
         ):
             raise RuntimeError("DeepSeek V4 draft metadata was not initialized")
-        dsv4_reset_attention_state()
         self._draft_decode_step += 1
         metadata = self._draft_decode_metadata
         if seq_lens is None:

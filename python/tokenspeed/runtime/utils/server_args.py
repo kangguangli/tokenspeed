@@ -253,7 +253,6 @@ class ServerArgs:
 
     # DeepSeek V4
     decode_context_parallel_size: int = 1
-    dcp_comm_backend: Literal["auto", "peer", "ag_rs", "a2a"] = "auto"
     deepseek_v4_mega_moe_max_num_tokens: int = 0
     deepseek_v4_indexer_prefill_max_logits_mb: int = 512
     deepseek_v4_prefill_chunk_size: int = 4
@@ -2035,12 +2034,6 @@ class ServerArgs:
             type=int,
             default=ServerArgs.decode_context_parallel_size,
             help="Shard DeepSeek V4 compressed KV over a subgroup of attention TP.",
-        )
-        parser.add_argument(
-            "--dcp-comm-backend",
-            choices=("auto", "peer", "ag_rs", "a2a"),
-            default=ServerArgs.dcp_comm_backend,
-            help="DCP partial combine: auto selects peer exchange with NCCL a2a fallback; peer requires the custom kernel.",
         )
         parser.add_argument(
             "--dense-tp-size",

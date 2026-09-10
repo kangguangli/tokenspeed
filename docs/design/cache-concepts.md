@@ -420,9 +420,9 @@ whole). No family restates the order of the stages, and `_RECIPES`
 **No round-trip reconciliation.** The pipeline is arranged so that pairs which
 would otherwise need cross-checking cannot differ:
 
-* the group set in the plan equals the declared one because `pack` consumes
-  the `(spec, fields)` pairs and `setup()` publishes the specs from those
-  same pairs;
+* `setup()` obtains `(spec, fields)` pairs from `groups()` and uses the same
+  local tuple for `pack` and spec publication, so both name the same group
+  set without a separate cache of declarations;
 * a field cannot name a group the plan does not have, because it never names
   one — `pack` carries the declaring group id alongside each field;
 * per-group packing is read from the layout, not recomputed, everywhere
@@ -465,26 +465,32 @@ publisher of `CacheRuntimeContract`, whose virtual counts and packing derive
 from these physical facts and each spec's `shard_count`. No separate placement
 or per-group address-space object is needed.
 
-DeepSeek V4 DCP decode gathers query heads, computes local no-sink attention
-partials, and combines them with LSE before applying the sink once. Prefill
-gathers packed cache bytes into a transient workspace and uses the ordinary
-local-page dequantizer to restore the rows.
+Splitting or regrouping fields can change physical packing and parent plane
+sizes. Capacity planning therefore uses the resulting physical parent byte
+size and each group's declared demand. Virtual placement alone does not impose
+a fixed parent size across different group declarations; field alignment and
+bounds remain the physical planner's responsibility.
 
-Attention backends bind their compute view through `set_cache_pool()` and read
-`cache_pool.arena.runtime_contract`. Target and draft views share that arena;
-executor and graph setup do not inject another V4 contract or group geometry.
-The V4 backend checks its DCP topology against the group specs at binding.
-Per-forward metadata retains a reference to the same contract for translation.
-C128 decode prepares local slots and lengths once per forward in two tensor
-fields. Graph replay updates them in place, and mixed decode slices use views
-of those outputs rather than repeating selection in each layer.
+Consumers bind a pool's compute view and read its arena's runtime contract.
+Views sharing an arena share that contract, rather than accepting separately
+injected copies of its geometry. Batch metadata retains the same contract for
+address translation.
 
 For physical packing K, N usable parents and D shards, a sharded
 group has `1 + N*K` local pages and `1 + N*D*K` virtual blocks. A replicated
 group uses one bucket. Existing `group_page_counts` and `group_packing` name
 physical quantities; the scheduler bridge explicitly consumes
 `virtual_block_counts` and `virtual_packing`. Virtual capacity must never be
-used to shape an arena field. Null ID 0 has no owner and forbids writes.
+used to shape an arena field. Virtual null ID 0 has no owner and is filtered
+during translation.
+
+Before zeroing scheduler blocks, the runtime checks IDs against the virtual
+bound and translates each group's batch to owned local IDs through the shared
+translation API. Translation precedes dispatch to pool views; pools and the
+arena receive physical IDs and hold no context rank. The arena's
+`zero_blocks()` validates every ID against its group's local page count before
+clearing any bytes. Physical page 0 is within that range and is handled like
+any other page when explicitly requested.
 
 The allocator receives only an integer `shard_count`, fixed when the
 coordinator registers the group in its pools. It counts
@@ -522,16 +528,6 @@ entry per available bucket of a partial parent. Request loads remain derived
 from `BlockTable` on each actual acquire; this optimization introduces no
 request counter that retract, prefix replacement, or table clearing must reset.
 
-References still govern the lifetime of the whole parent binding. Different
-requests may own its children, and a cached-prefix ref can keep it bound after
-the originating request finishes. DCP does not add a second allocator, alter
-prefix identity, or put process groups or GPU work in the scheduler.
-
-DeepSeek V4 shards only compressed-KV groups, with target and MTP fields in
-the same ratio group. DCP>1 splits replicated indexer KV from compressed KV.
-The split fits into the original plane byte budgets; its physical packing is
-independent of D and its capacity effect is accounted separately. DCP1 keeps
-the original grouping and physical plan.
 
 ## Code placement
 

@@ -60,14 +60,15 @@ def normalize_dcp_partials(
     swa_lens: torch.Tensor,
     extra_lens: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Normalize empty FlashMLA partials in one kernel.
+    """Normalize empty attention partials for the runtime DCP combine.
 
     Args:
         output: CUDA partials [tokens, heads, dim], updated in place only for
             empty selections. Nonempty values (including NaNs) are preserved.
         lse: Natural-log FP32 [tokens, heads], possibly strided.
         swa_lens: Int32 valid SWA lengths [tokens].
-        extra_lens: Optional Int32 compressed lengths [tokens].
+        extra_lens: Optional int32 local valid compressed counts [tokens].
+            These exclude masked holes, unlike the attention scan lengths.
 
     Returns:
         The input output tensor, and contiguous FP32 LSE. Empty rows become
@@ -89,142 +90,6 @@ def normalize_dcp_partials(
         BLOCK=triton.next_power_of_2(output.shape[2]),
     )
     return output, normalized
-
-
-def pack_dcp_partials(
-    output: torch.Tensor, lse: torch.Tensor, degree: int
-) -> torch.Tensor:
-    """Pack BF16/FP16 output and lossless FP32 LSE words for one all-to-all.
-
-    Args:
-        output: No-sink partial output [tokens, gathered_heads, head_dim].
-        lse: Matching natural-log FP32 LSE [tokens, gathered_heads].
-        degree: Number of owners, dividing the gathered head count.
-
-    Returns:
-        Transport tensor [degree, tokens, local_heads, head_dim + 2]. The
-        final two 16-bit words preserve the FP32 LSE bit pattern exactly.
-    """
-    if output.ndim != 3 or lse.shape != output.shape[:-1]:
-        raise ValueError("DCP partial output and LSE shapes disagree")
-    if (
-        output.dtype not in (torch.bfloat16, torch.float16)
-        or lse.dtype != torch.float32
-    ):
-        raise TypeError("DCP transport requires 16-bit output and FP32 LSE")
-    if output.device != lse.device or degree <= 0 or output.shape[1] % degree:
-        raise ValueError("DCP transport topology or device is invalid")
-    tokens, heads, dim = output.shape
-    local_heads = heads // degree
-    packed = torch.empty(
-        (degree, tokens, local_heads, dim + 2), dtype=output.dtype, device=output.device
-    )
-    if output.is_cuda:
-        _pack_dcp_output_lse(
-            output,
-            lse,
-            packed,
-            world_size=degree,
-            heads_per_rank=local_heads,
-            head_dim=dim,
-        )
-    else:
-        packed[..., :dim].copy_(
-            output.reshape(tokens, degree, local_heads, dim).permute(1, 0, 2, 3)
-        )
-        words = (
-            lse.contiguous().view(torch.uint16).reshape(tokens, degree, local_heads, 2)
-        )
-        packed.view(torch.uint16)[..., dim:].copy_(words.permute(1, 0, 2, 3))
-    return packed
-
-
-@triton.jit
-def _pack_dcp_output_lse_kernel(
-    output_ptr,
-    lse_ptr,
-    packed_ptr,
-    output_stride_b,
-    output_stride_h,
-    output_stride_d,
-    lse_stride_b,
-    lse_stride_h,
-    packed_stride_rank,
-    packed_stride_b,
-    packed_stride_h,
-    packed_stride_d,
-    world_size: tl.constexpr,
-    heads_per_rank: tl.constexpr,
-    head_dim: tl.constexpr,
-    value_block: tl.constexpr,
-):
-    batch_idx = tl.program_id(0).to(tl.int64)
-    local_head = tl.program_id(1).to(tl.int64)
-    value_offsets = tl.arange(0, value_block)
-    value_mask = value_offsets < head_dim
-    for destination in tl.static_range(world_size):
-        source_head = destination * heads_per_rank + local_head
-        packed_base = (
-            destination * packed_stride_rank
-            + batch_idx * packed_stride_b
-            + local_head * packed_stride_h
-        )
-        values = tl.load(
-            output_ptr
-            + batch_idx * output_stride_b
-            + source_head * output_stride_h
-            + value_offsets * output_stride_d,
-            mask=value_mask,
-        )
-        tl.store(
-            packed_ptr + packed_base + value_offsets * packed_stride_d,
-            values,
-            mask=value_mask,
-        )
-        lse = tl.load(
-            lse_ptr + batch_idx * lse_stride_b + source_head * lse_stride_h
-        ).to(tl.float32)
-        bits = lse.to(tl.uint32, bitcast=True)
-        low = (bits & 0xFFFF).to(tl.uint16)
-        high = ((bits >> 16) & 0xFFFF).to(tl.uint16)
-        tl.store(
-            packed_ptr + packed_base + head_dim * packed_stride_d,
-            low.to(packed_ptr.dtype.element_ty, bitcast=True),
-        )
-        tl.store(
-            packed_ptr + packed_base + (head_dim + 1) * packed_stride_d,
-            high.to(packed_ptr.dtype.element_ty, bitcast=True),
-        )
-
-
-def _pack_dcp_output_lse(
-    output: torch.Tensor,
-    lse: torch.Tensor,
-    packed: torch.Tensor,
-    *,
-    world_size: int,
-    heads_per_rank: int,
-    head_dim: int,
-) -> None:
-    batch = output.shape[0]
-    _pack_dcp_output_lse_kernel[(batch, heads_per_rank)](
-        output,
-        lse,
-        packed,
-        output.stride(0),
-        output.stride(1),
-        output.stride(2),
-        lse.stride(0),
-        lse.stride(1),
-        packed.stride(0),
-        packed.stride(1),
-        packed.stride(2),
-        packed.stride(3),
-        world_size=world_size,
-        heads_per_rank=heads_per_rank,
-        head_dim=head_dim,
-        value_block=triton.next_power_of_2(head_dim),
-    )
 
 
 @triton.jit
@@ -312,57 +177,6 @@ def _dcp_sink_kernel(
     ).to(tl.float32)
     tl.store(
         result + (token * HEADS + head) * DIM + offsets, value * factor, offsets < DIM
-    )
-
-
-@triton.jit
-def _dcp_merge_packed_kernel(
-    packed,
-    words,
-    sink,
-    result,
-    TOKENS: tl.constexpr,
-    HEADS: tl.constexpr,
-    DIM: tl.constexpr,
-    DEGREE: tl.constexpr,
-    BLOCK: tl.constexpr,
-    SHARDS: tl.constexpr,
-):
-    token = tl.program_id(0)
-    head = tl.program_id(1)
-    shards = tl.arange(0, SHARDS)
-    base = ((shards * TOKENS + token) * HEADS + head) * (DIM + 2)
-    low = tl.load(words + base + DIM, shards < DEGREE, other=0).to(tl.uint32)
-    high = tl.load(words + base + DIM + 1, shards < DEGREE, other=0).to(tl.uint32)
-    lse = tl.where(
-        shards < DEGREE,
-        (low | (high << 16)).to(tl.float32, bitcast=True),
-        -float("inf"),
-    )
-    maximum = tl.max(lse, 0)
-    has_nan = tl.sum((lse != lse).to(tl.int32), 0) > 0
-    safe_max = tl.where(maximum == -float("inf"), 0.0, maximum)
-    mass = tl.exp(lse - safe_max)
-    denominator = tl.sum(mass, 0)
-    weights = mass / tl.maximum(denominator, 1.1754943508222875e-38)
-    weights = tl.where(has_nan, float("nan"), weights)
-    combined = tl.where(
-        denominator == 0.0, -float("inf"), maximum + tl.log(denominator)
-    )
-    offsets = tl.arange(0, BLOCK)
-    values = tl.load(
-        packed + base[:, None] + offsets[None, :],
-        (shards[:, None] < DEGREE) & (offsets[None, :] < DIM),
-        other=0,
-    ).to(tl.float32)
-    values = tl.where((lse != -float("inf"))[:, None], values, 0.0)
-    output = tl.sum(values * weights[:, None], 0)
-    sink_logit = tl.load(sink + head).to(tl.float32)
-    factor = tl.where(
-        combined == -float("inf"), 0.0, 1.0 / (1.0 + tl.exp(sink_logit - combined))
-    )
-    tl.store(
-        result + (token * HEADS + head) * DIM + offsets, output * factor, offsets < DIM
     )
 
 
@@ -463,50 +277,6 @@ def dcp_apply_sink(
         HEADS=heads,
         DIM=dim,
         BLOCK=triton.next_power_of_2(dim),
-        enable_fp_fusion=False,
-        num_warps=4,
-    )
-    return result
-
-
-def dcp_merge_packed_partials(packed: torch.Tensor, sink: torch.Tensor) -> torch.Tensor:
-    """Merge lossless-LSE all-to-all payload in FP32 and apply one TP-local sink.
-
-    Args:
-        packed: Contiguous BF16/FP16 [shards, tokens, TP-local heads, dim + 2].
-            The final two words hold each FP32 natural-log LSE bit pattern.
-        sink: Contiguous sink logits covering the TP-local heads.
-
-    Returns:
-        Contiguous output [tokens, TP-local heads, dim], typed like packed.
-    """
-    if packed.ndim != 4 or not packed.is_cuda or not packed.is_contiguous():
-        raise ValueError("DCP merge requires contiguous four-dimensional CUDA data")
-    if packed.dtype not in (torch.bfloat16, torch.float16) or packed.shape[-1] <= 2:
-        raise ValueError("DCP merge requires 16-bit O plus two LSE words")
-    degree, tokens, heads, transport = packed.shape
-    if (
-        degree <= 0
-        or sink.numel() < heads
-        or sink.device != packed.device
-        or not sink.is_contiguous()
-    ):
-        raise ValueError("DCP merge topology or sink is invalid")
-    dim = transport - 2
-    result = torch.empty((tokens, heads, dim), device=packed.device, dtype=packed.dtype)
-    if tokens == 0:
-        return result
-    _dcp_merge_packed_kernel[(tokens, heads)](
-        packed,
-        packed.view(torch.uint16),
-        sink,
-        result,
-        TOKENS=tokens,
-        HEADS=heads,
-        DIM=dim,
-        DEGREE=degree,
-        BLOCK=triton.next_power_of_2(dim),
-        SHARDS=triton.next_power_of_2(degree),
         enable_fp_fusion=False,
         num_warps=4,
     )

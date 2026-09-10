@@ -163,7 +163,6 @@ class AttnConfig:
     dcp_size: int = 1
     dcp_rank: int = 0
     dcp_group: tuple[int, ...] = (0,)
-    dcp_comm_backend: str = "auto"
     components: tuple[AttnComponentSpec, ...]
 
     def __post_init__(self):
@@ -232,7 +231,6 @@ def model_wide_kwargs(
             dcp_size=attn_mapping.dcp_size,
             dcp_rank=attn_mapping.dcp_rank,
             dcp_group=attn_mapping.dcp_group,
-            dcp_comm_backend=server_args.dcp_comm_backend,
         )
     if server_args.speculative_algorithm is not None:
         kwargs.update(
