@@ -114,6 +114,10 @@ class TritonRSAGBackend:
         scattered_num_tokens: list[int],
     ) -> torch.Tensor:
         state = self._get_or_create(group, tensor.size(-1))
+        # Cached history can exceed the scheduled-token budget used to size
+        # this workspace. Keep captured pointers stable and use NCCL instead.
+        if sum(scattered_num_tokens) > state.max_token_num:
+            return self._fallback.token_all_gather(tensor, group, scattered_num_tokens)
         return all_gather(state, tensor, token_list_in_group=scattered_num_tokens)
 
     def token_reduce_scatter(
@@ -123,6 +127,10 @@ class TritonRSAGBackend:
         scattered_num_tokens: list[int],
     ) -> torch.Tensor:
         state = self._get_or_create(group, tensor.size(-1))
+        if sum(scattered_num_tokens) > state.max_token_num:
+            return self._fallback.token_reduce_scatter(
+                tensor, group, scattered_num_tokens
+            )
         return reduce_scatter(state, tensor, token_list_in_group=scattered_num_tokens)
 
     def _get_max_num_gathered_tokens(self):
