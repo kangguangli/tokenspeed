@@ -1,7 +1,10 @@
 import re
 import subprocess
 import textwrap
+from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pipeline
 import pytest
@@ -24,6 +27,7 @@ from pipeline import (
     get_runner_specific_env,
     get_stage_commands,
     is_amd_runner,
+    is_cpu_only_runner,
     is_gb200_runner,
     is_nvidia_arm_runner,
     parse_args,
@@ -64,6 +68,28 @@ def test_stale_process_patterns_match_existing_targets():
         ), f"no STALE_PROCESS_PATTERNS entry matched cmdline: {cmdline!r}"
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        pipeline.URLError("not ready"),
+        ConnectionResetError("connection reset by peer"),
+        TimeoutError("probe timed out"),
+    ],
+)
+def test_poll_readiness_retries_transient_errors(monkeypatch, error):
+    probe = Mock(side_effect=[error, nullcontext(SimpleNamespace(status=200))])
+    monkeypatch.setattr(pipeline, "urlopen", probe)
+
+    poll_readiness(
+        {"url": "http://127.0.0.1:8000/readiness", "interval": 0, "timeout": 1},
+        False,
+        process=None,
+        log_path=None,
+    )
+
+    assert probe.call_count == 2
+
+
 def test_poll_readiness_fails_when_server_process_exits(monkeypatch, tmp_path):
     class ServerProcess:
         calls = 0
@@ -102,8 +128,43 @@ def test_amd_runner_prefixes_cover_legacy_and_arc_labels():
     assert is_amd_runner("amd-mi350-1gpu-bench")
     assert is_amd_runner("amd-mi350-4gpu-bench")
     assert is_amd_runner("amd-mi450-sim")
+    assert is_amd_runner("amd-mi45x-cpu-test")
     assert not is_amd_runner("b200-1gpu")
     assert not is_amd_runner("gb200-4gpu-perf")
+
+
+def test_cpu_only_runners_are_told_apart_from_gpu_pools():
+    # The emulator lane holds no device, so the GPU reclaim run before every
+    # other AMD task has nothing to reclaim there.
+    assert is_cpu_only_runner("amd-mi45x-cpu-test")
+    assert not is_cpu_only_runner("amd-mi35x-1gpu-test")
+    assert not is_cpu_only_runner("amd-mi355-1gpu-bench")
+
+
+def test_cpu_only_amd_runner_skips_the_gpu_reclaim(capsys, tmp_path):
+    pipeline.setup_runner(
+        "amd-mi45x-cpu-test",
+        {},
+        tmp_path,
+        dry_run=True,
+        reuse_state=False,
+        setup_mode="ci",
+    )
+
+    assert "cleanup_amd_gpu_state.sh" not in capsys.readouterr().out
+
+
+def test_amd_gpu_runner_reclaims_stale_vram(capsys, tmp_path):
+    pipeline.setup_runner(
+        "amd-mi35x-1gpu-test",
+        {},
+        tmp_path,
+        dry_run=True,
+        reuse_state=False,
+        setup_mode="ci",
+    )
+
+    assert "cleanup_amd_gpu_state.sh" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(

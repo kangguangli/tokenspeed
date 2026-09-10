@@ -377,40 +377,40 @@ def _mla_decode_fwd_kernel(
             physical_block_idx * stride_kv_buffer_0 + kv_head_idx * stride_kv_buffer_2
         )
 
-        kv_lora_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        kv_lora_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
             base=kv_buffer_ptr + kv_offset,
             shape=(TILE_SIZE, KV_LORA_RANK),
             strides=(stride_kv_buffer_1, stride_kv_buffer_3),
             block_shape=(TILE_SIZE, KV_LORA_RANK),
             layout=cfg.KV_LORA_SHARED_LAYOUT,
         )
-        k_rope_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        k_rope_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
             base=kv_buffer_ptr + kv_offset + KV_LORA_RANK * stride_kv_buffer_3,
             shape=(TILE_SIZE, QK_ROPE_HEAD_DIM),
             strides=(stride_kv_buffer_1, stride_kv_buffer_3),
             block_shape=(TILE_SIZE, QK_ROPE_HEAD_DIM),
             layout=cfg.K_ROPE_SHARED_LAYOUT,
         )
-        gl.amd.gfx1250.tdm.async_load(
+        gl.amd.cdna5.tdm.async_load(
             kv_lora_desc,
             [0, 0],
             kv_lora_shared,
             cache_modifier=cfg.kv_cache_modifier,
         )
-        gl.amd.gfx1250.tdm.async_load(
+        gl.amd.cdna5.tdm.async_load(
             k_rope_desc,
             [0, 0],
             k_rope_shared,
             cache_modifier=cfg.kv_cache_modifier,
         )
-        gl.amd.gfx1250.tdm.async_wait(0)
+        gl.amd.cdna5.tdm.async_wait(0)
 
         S = gl.zeros([BLOCK_M, TILE_SIZE], dtype=tl.float32, layout=cfg.QK_WMMA_LAYOUT)
 
         KV_lora = kv_lora_shared.permute((1, 0)).load(layout=cfg.K_DOT_LAYOUT)
-        S = gl.amd.gfx1250.wmma(Q_lora, KV_lora.to(Q_lora.dtype), S)
+        S = gl.amd.cdna5.wmma(Q_lora, KV_lora.to(Q_lora.dtype), S)
         K_rope = k_rope_shared.permute((1, 0)).load(layout=cfg.K_DOT_LAYOUT)
-        S = gl.amd.gfx1250.wmma(Q_rope, K_rope.to(Q_lora.dtype), S) * qk_factor
+        S = gl.amd.cdna5.wmma(Q_rope, K_rope.to(Q_lora.dtype), S) * qk_factor
 
         seq_mask = seq_offset[None, :] < context_len + query_pos_qk[:, None] + 1
 
@@ -451,7 +451,7 @@ def _mla_decode_fwd_kernel(
         else:
             P = P.to(KV_lora_trans.dtype, fp_downcast_rounding="rtz")
         P = gl.convert_layout(P, layout=cfg.P_DOT_LAYOUT)
-        acc = gl.amd.gfx1250.wmma(P, KV_lora_trans, acc)
+        acc = gl.amd.cdna5.wmma(P, KV_lora_trans, acc)
         seq_offset += TILE_SIZE
 
     if kv_scale_ptr is not None:
@@ -579,7 +579,7 @@ def _mla_decode_fwd_reduce_kernel(
     # TDM async load split output into shared memory.
     SPLIT_OUTPUT_COLS: gl.constexpr = gl.constexpr(NUM_KV_SPLITS * KV_LORA_RANK)
     total_rows = total_num_tokens * num_query_heads
-    split_output_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+    split_output_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
         base=split_output_ptr,
         shape=(total_rows, SPLIT_OUTPUT_COLS),
         strides=(SPLIT_OUTPUT_COLS, gl.constexpr(1)),
@@ -594,7 +594,7 @@ def _mla_decode_fwd_reduce_kernel(
 
     # row offset: query_token_idx * num_query_heads + query_head_idx
     row_idx = (query_token_idx * num_query_heads + query_head_idx).to(gl.int32)
-    gl.amd.gfx1250.tdm.async_load(
+    gl.amd.cdna5.tdm.async_load(
         split_output_desc,
         [row_idx, 0],
         split_output_shared,
@@ -637,7 +637,7 @@ def _mla_decode_fwd_reduce_kernel(
     overall_expsum = gl.sum(split_expsum)
 
     # Wait for the async load and read from shared memory
-    gl.amd.gfx1250.tdm.async_wait(0)
+    gl.amd.cdna5.tdm.async_wait(0)
     split_output = split_output_shared.reshape((NUM_KV_SPLITS, KV_LORA_RANK)).load(
         layout=REDUCE_LAYOUT
     )
@@ -687,6 +687,25 @@ def _select_num_kv_splits(
     # A two-wave attention workgroup permits two resident workgroups per CU.
     target = max(1, (num_sms * 4 // 4) * 2 // max(1, num_q_programs))
     return triton.next_power_of_2(min(max_kv_splits, target))
+
+
+def _select_projected_value_num_kv_splits(
+    *,
+    batch_size: int,
+    num_sms: int,
+    num_q_programs: int,
+    max_seqlen_k: int,
+    tile_size: int,
+) -> int:
+    pages = max(1, math.ceil(max_seqlen_k / tile_size))
+    work_cap = max(16 if batch_size == 1 else 8, math.ceil(pages / 16))
+    occupancy_cap = max(1, 512 // batch_size)
+    split_cap = triton.next_power_of_2(min(64, occupancy_cap, work_cap))
+    target = max(
+        1,
+        (num_sms * 2) // max(1, num_q_programs),
+    )
+    return triton.next_power_of_2(min(pages, split_cap, target))
 
 
 def gluon_mla_decode_gfx1250(
@@ -781,19 +800,20 @@ def gluon_mla_decode_gfx1250(
     total_num_q_blocks = batch_size * num_head_blocks
     num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
     if projected_value:
-        if max_seqlen_k > 32768:
-            split_cap = 32
-        else:
-            split_cap = 16
+        num_kv_splits = _select_projected_value_num_kv_splits(
+            batch_size=batch_size,
+            num_sms=num_sms,
+            num_q_programs=total_num_q_blocks,
+            max_seqlen_k=max_seqlen_k,
+            tile_size=page_size,
+        )
     else:
-        split_cap = 64
-    num_kv_splits = _select_num_kv_splits(
-        num_sms=num_sms,
-        num_q_programs=total_num_q_blocks,
-        max_seqlen_k=max_seqlen_k,
-        tile_size=page_size,
-        split_cap=split_cap,
-    )
+        num_kv_splits = _select_num_kv_splits(
+            num_sms=num_sms,
+            num_q_programs=total_num_q_blocks,
+            max_seqlen_k=max_seqlen_k,
+            tile_size=page_size,
+        )
 
     split_output = torch.empty(
         (batch_size, num_query_heads, num_kv_splits, kv_lora_rank),
@@ -928,10 +948,11 @@ def gluon_mla_decode_projected_value_gfx1250(
     """Decode MLA and fuse split reduction, BF16 projection, and sigmoid gating.
 
     Args:
-        q: FP8 absorbed query shaped ``[1, 1, heads, 576]`` for 12 or 16 heads.
+        q: FP8 absorbed query shaped ``[batch, 1, heads, 576]`` for 12 or
+            16 heads.
         kv_cache: Contiguous matching-FP8 paged cache with page size 64.
-        page_table: Int32 page table for the single sequence.
-        cache_seqlens: Int32 visible cache length for the sequence.
+        page_table: Batched Int32 page table.
+        cache_seqlens: Int32 visible cache length for each sequence.
         max_seqlen_k: Maximum visible KV length used for split selection.
         qk_nope_head_dim: Original non-RoPE head width, which must be 128.
         kv_lora_rank: Latent rank, which must be 512.
@@ -939,8 +960,8 @@ def gluon_mla_decode_projected_value_gfx1250(
         softmax_scale: Scale applied to QK logits.
         value_weight: Contiguous BF16 weights shaped ``[heads, 512, 128]``.
         gate: Optional contiguous BF16 raw sigmoid gate shaped
-            ``[1, heads * 128]``.
-        out: Contiguous BF16 output shaped ``[1, heads * 128]``.
+            ``[batch, heads * 128]``.
+        out: Contiguous BF16 output shaped ``[batch, heads * 128]``.
         logit_cap: Unsupported logit cap; must be zero.
 
     Returns:
@@ -955,9 +976,16 @@ def gluon_mla_decode_projected_value_gfx1250(
             "projected-value MLA requires qk_nope/kv_lora/qk_rope dimensions "
             "(128, 512, 64)"
         )
-    expected_weight = (q.shape[2], kv_lora_rank, out.shape[-1] // q.shape[2])
+    if value_weight.ndim != 3:
+        raise ValueError("value_weight must be rank-3")
+    batch, heads = q.shape[0], q.shape[2]
+    value = value_weight.shape[2]
+    expected_weight = (heads, kv_lora_rank, value)
     if tuple(value_weight.shape) != expected_weight:
         raise ValueError(f"value_weight must have shape {expected_weight}")
+    expected_out = (batch, heads * value)
+    if tuple(out.shape) != expected_out:
+        raise ValueError(f"out must have shape {expected_out}")
     if gate is not None and gate.shape != out.shape:
         raise ValueError("gate and out must have matching shapes")
     if (

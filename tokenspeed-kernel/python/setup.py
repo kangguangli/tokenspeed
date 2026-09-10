@@ -418,6 +418,13 @@ KERNEL_GROUPS = [
         [],
     ),
     (
+        "mhc_big_fuse",
+        [
+            CUDA_CSRC_DIR / "mhc_big_fuse.cu",
+        ],
+        [],
+    ),
+    (
         "flashinfer_softmax",
         [
             CUDA_CSRC_DIR / "flashinfer_softmax.cu",
@@ -470,7 +477,6 @@ KERNEL_GROUPS = [
             CUDA_CSRC_DIR / "trtllm_mnnvl_allreduce_fusion.cu",
             CUDA_CSRC_DIR / "trtllm_reducescatter_fusion.cu",
             CUDA_CSRC_DIR / "trtllm_allgather_fusion.cu",
-            CUDA_CSRC_DIR / "minimax_reduce_rms.cu",
         ],
         [],
     ),

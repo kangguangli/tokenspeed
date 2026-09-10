@@ -68,7 +68,7 @@ from tokenspeed.runtime.distributed.comm_ops import (
     prepare_all_reduce_fusion,
     prepare_all_reduce_lane,
 )
-from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+from tokenspeed.runtime.execution.forward_step import (
     get_is_capture_mode,
     get_is_cuda_graph_phase,
 )
@@ -549,8 +549,8 @@ def _acquire_symm_join_outputs(
     The pair matters, not just the memory: ``AutoBackend.all_reduce`` only
     consults ``can_reduce_outputs`` on its tuple branch, so a single
     concatenated operand can never reach the symmetric kernel however it was
-    allocated. This is the shape ``latent_moe_expert_shared_all_reduce`` uses
-    for EP-only layouts.
+    allocated. ``latent_moe_expert_shared_all_reduce`` uses this pair on AMD
+    for both TP/TP and TP/EP mappings; the collective group is MoE TP x EP.
 
     Collective in the same sense the acquire is: every rank of the MoE TP x EP
     group reaches this with rank-uniform shapes, so none can disagree about
@@ -610,7 +610,7 @@ class K3MoeTailComm:
         self.up_proj = up_proj
         self.execution_plan = execution_plan
         # Derived from the projection itself (built with a shard group iff
-        # _shard_k3_up_projection held), so comm and module cannot disagree.
+        # _shard_k3_latent_projection held), so comm and module cannot disagree.
         self._shard_up_projection = up_proj.shard_group is not None
         self.latent_tail = None
         if self.state.latent_tail_ok:

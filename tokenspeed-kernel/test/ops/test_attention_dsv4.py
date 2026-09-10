@@ -22,21 +22,37 @@ from tokenspeed_kernel.ops.attention.cuda.dsv4 import (
     persistent_topk,
 )
 from tokenspeed_kernel.ops.attention.triton.dsv4 import (
+    _dsv4_decode_dense_compressed_indices_and_lens_kernel,
     _dsv4_decode_swa_indices_and_lens_kernel,
     _dsv4_dequantize_and_gather_k_kernel,
     _dsv4_fused_csa_indexer_mxfp4_cache_kernel,
     _dsv4_fused_sparse_compress_cache_kernel,
     _dsv4_gather_launch_config,
+    _dsv4_use_serial_four_block_indexer_q,
     dsv4_combine_dense_swa_indices,
     dsv4_combine_topk_swa_indices,
+    dsv4_compact_compressed_slot_mapping,
     dsv4_compressed_slot_mapping,
     dsv4_compute_global_topk_indices_and_lens,
+    dsv4_decode_dense_compressed_indices_and_lens,
     dsv4_decode_swa_indices_and_lens,
     dsv4_dequantize_and_gather_k_cache,
+    dsv4_fused_indexer_q_rope_hadamard_mxfp4,
+    dsv4_group_slot_mapping,
+    dsv4_validate_active_cache_pages,
+    write_dsv4_indexer_mxfp4_cache_cuda,
 )
 from tokenspeed_kernel.ops.transform import hadamard_transform
 
 from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
+    DEEPSEEK_V4_FP8_MAX,
+    DEEPSEEK_V4_FP8_QUANT_BLOCK,
+    DEEPSEEK_V4_MXFP4_BLOCK_SIZE,
+    deepseek_v4_indexer_fp8_row_bytes,
+    deepseek_v4_indexer_fp8_scale_bytes,
+    deepseek_v4_indexer_mxfp4_layout_from_row_bytes,
+    deepseek_v4_indexer_mxfp4_row_bytes,
+    deepseek_v4_nope_dim,
     deepseek_v4_swa_scale_dim,
     deepseek_v4_swa_token_stride,
 )
@@ -45,13 +61,9 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     deepseek_v4_csa_indexer_cache_insert,
     deepseek_v4_hca_compress_kv_cache_insert,
     deepseek_v4_prepare_indexer_q_mxfp4,
-    dequantize_deepseek_v4_fp8_ds_mla_cache,
     fused_qnorm_rope_kv_insert,
     read_deepseek_v4_indexer_fp8_cache,
-    read_deepseek_v4_indexer_mxfp4_cache,
     save_deepseek_v4_compressor_state,
-    write_deepseek_v4_indexer_fp8_cache,
-    write_deepseek_v4_indexer_mxfp4_cache,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
     _mask_invalid_graph_tokens,
@@ -159,6 +171,237 @@ def _e2m1_values(nibbles: torch.Tensor) -> torch.Tensor:
         [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32
     )
     return table[(nibbles & 0x7).long()] * torch.where((nibbles & 0x8) != 0, -1.0, 1.0)
+
+
+# Torch references for the dsv4 cache kernels below; they mirror the cache
+# layouts the runtime geometry declares and exist only to check the kernels.
+def _indexer_mxfp4_layout_from_cache(
+    cache_2d: torch.Tensor,
+    block_size: int,
+) -> tuple[int, int, int]:
+    if cache_2d.dim() != 2:
+        raise ValueError(f"cache_2d must be 2-D, got {tuple(cache_2d.shape)}")
+    row_bytes = cache_2d.shape[1] // block_size
+    if cache_2d.shape[1] % block_size != 0:
+        raise ValueError(
+            "MXFP4 indexer cache row size must match value+scale layout, "
+            f"got cache shape {tuple(cache_2d.shape)} and block_size={block_size}"
+        )
+    return deepseek_v4_indexer_mxfp4_layout_from_row_bytes(row_bytes)
+
+
+def _fp8_e4m3_pow2_bytes(block: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    scale = max(float(block.detach().abs().max()) / DEEPSEEK_V4_FP8_MAX, 1.0e-10)
+    scale = 2.0 ** math.ceil(math.log2(scale))
+    scaled = torch.clamp(block / scale, -DEEPSEEK_V4_FP8_MAX, DEEPSEEK_V4_FP8_MAX)
+    return scaled.to(torch.float8_e4m3fn).view(torch.uint8), block.new_tensor(scale)
+
+
+def dequantize_deepseek_v4_fp8_ds_mla_cache(
+    cache_2d: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_size: int = 64,
+    *,
+    head_dim: int,
+    rope_dim: int,
+) -> torch.Tensor:
+    """Dequantize DeepSeek V4 `fp8_ds_mla` rows selected by global slots."""
+
+    nope_dim = deepseek_v4_nope_dim(head_dim, rope_dim)
+    token_stride = deepseek_v4_swa_token_stride(head_dim, rope_dim)
+    scale_dim = deepseek_v4_swa_scale_dim(head_dim, rope_dim)
+    min_stride = block_size * (token_stride + scale_dim)
+    if cache_2d.dtype != torch.uint8:
+        raise TypeError(f"cache_2d must be uint8, got {cache_2d.dtype}")
+    if cache_2d.dim() != 2 or cache_2d.shape[1] < min_stride:
+        raise ValueError(
+            f"cache_2d must be [pages, >= {min_stride}], got {tuple(cache_2d.shape)}"
+        )
+
+    out_shape = (slot_mapping.numel(), head_dim)
+    if slot_mapping.numel() == 0:
+        return torch.empty(out_shape, device=cache_2d.device, dtype=torch.bfloat16)
+
+    num_nope_blocks = nope_dim // DEEPSEEK_V4_FP8_QUANT_BLOCK
+
+    slots = slot_mapping.to(torch.int64)
+    valid = slots >= 0
+    safe_slots = torch.where(valid, slots, torch.zeros_like(slots))
+    pages = torch.div(safe_slots, block_size, rounding_mode="floor")
+    pos = safe_slots % block_size
+    # Index pages via advanced indexing on the 2-D cache, NOT via
+    # page * stride(0) into reshape(-1): on a strided field view of a larger
+    # LCM arena, reshape(-1) copies only the logical elements and
+    # physical-stride offsets read past its end.
+    value_base = pos * token_stride
+    scale_base = block_size * token_stride + pos * scale_dim
+
+    value_offsets = (
+        value_base[:, None]
+        + torch.arange(token_stride, device=cache_2d.device, dtype=torch.int64)[None, :]
+    )
+    row_bytes = cache_2d[pages[:, None], value_offsets]
+    nope = row_bytes[:, :nope_dim].contiguous().view(torch.float8_e4m3fn)
+
+    scale_offsets = (
+        scale_base[:, None]
+        + torch.arange(num_nope_blocks, device=cache_2d.device, dtype=torch.int64)[
+            None, :
+        ]
+    )
+    scales = torch.pow(
+        2.0, cache_2d[pages[:, None], scale_offsets].to(torch.int32) - 127
+    )
+    scales = scales.float().repeat_interleave(DEEPSEEK_V4_FP8_QUANT_BLOCK, dim=1)
+
+    rope = row_bytes[:, nope_dim:token_stride].contiguous()
+    out = torch.cat([nope.float() * scales, rope.view(torch.bfloat16).float()], dim=1)
+    out = out.to(torch.bfloat16)
+    return torch.where(valid[:, None], out, torch.zeros_like(out))
+
+
+def write_deepseek_v4_indexer_fp8_cache(
+    index_k: torch.Tensor,
+    cache_2d: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_size: int = 64,
+) -> None:
+    """Write FP8 indexer keys using `[values | fp32 scale]` page layout."""
+
+    if index_k.dim() != 2:
+        raise ValueError(f"index_k must be [tokens, dim], got {tuple(index_k.shape)}")
+    index_head_dim = int(index_k.shape[-1])
+    scale_bytes = deepseek_v4_indexer_fp8_scale_bytes(index_head_dim)
+    row_bytes = deepseek_v4_indexer_fp8_row_bytes(index_head_dim)
+    if cache_2d.dtype != torch.uint8:
+        raise TypeError(f"cache_2d must be uint8, got {cache_2d.dtype}")
+    min_stride = block_size * row_bytes
+    if cache_2d.dim() != 2 or cache_2d.shape[1] < min_stride:
+        raise ValueError(
+            f"cache_2d must be [pages, >= {min_stride}], got {tuple(cache_2d.shape)}"
+        )
+
+    num_actual = min(slot_mapping.numel(), index_k.shape[0])
+    for token_idx in range(num_actual):
+        slot = int(slot_mapping[token_idx].item())
+        if slot < 0:
+            continue
+        page = slot // block_size
+        pos = slot % block_size
+        # Row-index the 2-D cache (strided-view safe) instead of computing
+        # page * stride(0) offsets into reshape(-1).
+        page_row = cache_2d[page]
+        value_base = pos * index_head_dim
+        scale_base = block_size * index_head_dim + pos * scale_bytes
+        q_bytes, scale = _fp8_e4m3_pow2_bytes(index_k[token_idx].float())
+        page_row[value_base : value_base + index_head_dim].copy_(q_bytes)
+        page_row[scale_base : scale_base + scale_bytes].copy_(
+            scale.reshape(1).view(torch.uint8)
+        )
+
+
+def write_deepseek_v4_indexer_mxfp4_cache(
+    index_k: torch.Tensor,
+    cache_2d: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_size: int = 64,
+) -> None:
+    """Write MXFP4 indexer keys using the `[values | ue8m0 scales]` layout."""
+
+    if index_k.dim() != 2:
+        raise ValueError(f"index_k must be [tokens, dim], got {tuple(index_k.shape)}")
+    index_head_dim = int(index_k.shape[-1])
+    row_bytes = deepseek_v4_indexer_mxfp4_row_bytes(index_head_dim)
+    if cache_2d.dtype != torch.uint8:
+        raise TypeError(f"cache_2d must be uint8, got {cache_2d.dtype}")
+    min_stride = block_size * row_bytes
+    if cache_2d.dim() != 2 or cache_2d.shape[1] < min_stride:
+        raise ValueError(
+            f"cache_2d must be [pages, >= {min_stride}], got {tuple(cache_2d.shape)}"
+        )
+
+    num_actual = min(slot_mapping.numel(), index_k.shape[0])
+    if num_actual == 0:
+        return
+    if not index_k.is_cuda:
+        raise ValueError(
+            "write_deepseek_v4_indexer_mxfp4_cache only supports CUDA tensors."
+        )
+    valid = torch.ones(num_actual, device=index_k.device, dtype=torch.bool)
+    write_dsv4_indexer_mxfp4_cache_cuda(
+        index_k[:num_actual],
+        cache_2d,
+        slot_mapping[:num_actual],
+        valid,
+        block_size,
+    )
+
+
+def read_deepseek_v4_indexer_mxfp4_cache(
+    cache_2d: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_size: int = 64,
+) -> torch.Tensor:
+    """Dequantize MXFP4 indexer cache rows selected by `slot_mapping`."""
+
+    if cache_2d.dtype != torch.uint8:
+        raise TypeError(f"cache_2d must be uint8, got {cache_2d.dtype}")
+    index_head_dim, value_bytes, scale_bytes = _indexer_mxfp4_layout_from_cache(
+        cache_2d, block_size
+    )
+    min_stride = block_size * (value_bytes + scale_bytes)
+    if cache_2d.dim() != 2 or cache_2d.shape[1] < min_stride:
+        raise ValueError(
+            f"cache_2d must be [pages, >= {min_stride}], got {tuple(cache_2d.shape)}"
+        )
+
+    out_shape = (slot_mapping.numel(), index_head_dim)
+    if slot_mapping.numel() == 0:
+        return torch.empty(out_shape, device=cache_2d.device, dtype=torch.float32)
+
+    slots = slot_mapping.to(torch.int64)
+    valid = slots >= 0
+    safe_slots = torch.where(valid, slots, torch.zeros_like(slots))
+    pages = torch.div(safe_slots, block_size, rounding_mode="floor")
+    pos = safe_slots % block_size
+    # Index pages via advanced indexing on the 2-D cache, NOT via
+    # page * stride(0) into reshape(-1): on a strided field view of a larger
+    # LCM arena, reshape(-1) copies only the logical elements and
+    # physical-stride offsets read past its end.
+    value_base = pos * value_bytes
+    scale_base = block_size * value_bytes + pos * scale_bytes
+
+    value_offsets = (
+        value_base[:, None]
+        + torch.arange(
+            value_bytes,
+            device=cache_2d.device,
+            dtype=torch.int64,
+        )[None, :]
+    )
+    packed = cache_2d[pages[:, None], value_offsets]
+
+    scale_offsets = (
+        scale_base[:, None]
+        + torch.arange(
+            scale_bytes,
+            device=cache_2d.device,
+            dtype=torch.int64,
+        )[None, :]
+    )
+    scales = torch.pow(
+        2.0, cache_2d[pages[:, None], scale_offsets].to(torch.int32) - 127
+    )
+    byte_scales = scales.float().repeat_interleave(
+        DEEPSEEK_V4_MXFP4_BLOCK_SIZE // 2, dim=1
+    )
+
+    even = _e2m1_values(packed & 0xF) * byte_scales
+    odd = _e2m1_values(packed >> 4) * byte_scales
+    out = torch.empty(out_shape, device=cache_2d.device, dtype=torch.float32)
+    out[:, 0::2] = even
+    out[:, 1::2] = odd
+    return torch.where(valid[:, None], out, torch.zeros_like(out))
 
 
 def _mxfp4_bytes_and_scales(
@@ -294,6 +537,39 @@ def _expected_overlap_normed(
 
 
 class DeepseekV4AttentionOpsCpuValidationTest(unittest.TestCase):
+    def test_indexer_q_serial_four_block_selector_is_fail_closed(self):
+        valid = {
+            "num_tokens": 8192,
+            "head_dim": 128,
+            "rope_dim": 64,
+            "quant_block": 32,
+            "is_cuda": True,
+            "is_hip": False,
+            "capability": (10, 0),
+            "shapes_valid": True,
+            "dtypes_valid": True,
+            "devices_valid": True,
+            "inner_strides": (1, 1, 1, 1),
+        }
+        self.assertTrue(_dsv4_use_serial_four_block_indexer_q(**valid))
+        invalid_overrides = (
+            {"num_tokens": 8191},
+            {"head_dim": 64},
+            {"rope_dim": 32},
+            {"quant_block": 64},
+            {"is_cuda": False},
+            {"is_hip": True},
+            {"capability": (9, 0)},
+            {"shapes_valid": False},
+            {"dtypes_valid": False},
+            {"devices_valid": False},
+            {"inner_strides": (2, 1, 1, 1)},
+        )
+        for override in invalid_overrides:
+            case = valid | override
+            with self.subTest(override=override):
+                self.assertFalse(_dsv4_use_serial_four_block_indexer_q(**case))
+
     def test_v4_table_kernels_do_not_specialize_runtime_geometry(self):
         cases = (
             (
@@ -306,6 +582,10 @@ class DeepseekV4AttentionOpsCpuValidationTest(unittest.TestCase):
             ),
             (
                 _dsv4_dequantize_and_gather_k_kernel,
+                ("block_table_stride", "max_blocks_per_seq"),
+            ),
+            (
+                _dsv4_decode_dense_compressed_indices_and_lens_kernel,
                 ("block_table_stride", "max_blocks_per_seq"),
             ),
             (
@@ -557,6 +837,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
                 cos_sin_cache=cos_sin,
                 rms_norm_eps=eps,
                 block_size=block_size,
+                validate_positions=True,
             )
 
         stream = torch.cuda.Stream()
@@ -648,6 +929,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
                 cos_sin_cache=cos_sin,
                 rms_norm_eps=eps,
                 block_size=block_size,
+                validate_positions=True,
             )
         except RuntimeError as exc:
             if "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert" in str(exc):
@@ -1051,7 +1333,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
 
         self._assert_persistent_topk_matches_torch(logits, lengths, output, topk)
 
-    def test_persistent_topk_matches_torch_for_batch_gt_32(self):
+    def test_persistent_topk_noncluster_fallback_matches_torch(self):
         if not has_persistent_topk():
             self.skipTest("DeepSeek V4 persistent top-k op is not available")
 
@@ -1059,9 +1341,13 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         device = torch.device("cuda")
         topk = 512
         num_rows = 36
-        stride = 544
+        stride = 65568
+        # More than 32 rows bypasses clusters on capable GPUs. The long live
+        # row exercises the same single-CTA streaming kernel used when cluster
+        # launch is unsupported; short rows verify graph-padded tail handling.
         lengths = torch.tensor(
-            [0, 17] + [520 + (idx % 24) for idx in range(num_rows - 2)],
+            [0, 17, 513, 9000, 33000, 65537]
+            + [520 + (idx % 24) for idx in range(num_rows - 6)],
             device=device,
             dtype=torch.int32,
         )
@@ -1078,11 +1364,178 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             output,
             workspace,
             topk,
-            int(lengths.max().item()),
+            stride,
         )
         torch.cuda.synchronize()
 
         self._assert_persistent_topk_matches_torch(logits, lengths, output, topk)
+
+    def test_persistent_topk_cluster_path_matches_torch_for_all_supported_k(self):
+        if not has_persistent_topk():
+            self.skipTest("DeepSeek V4 persistent top-k op is not available")
+
+        torch.manual_seed(6792)
+        device = torch.device("cuda")
+        stride = 262144
+        workspace = torch.empty((1024 * 1024,), device=device, dtype=torch.uint8)
+
+        for topk in (512, 1024, 2048):
+            with self.subTest(topk=topk):
+                lengths = torch.tensor(
+                    [topk + 1, 8192, 65537, 131071, 262143],
+                    device=device,
+                    dtype=torch.int32,
+                )
+                logits = torch.randn(
+                    (lengths.numel(), stride),
+                    device=device,
+                    dtype=torch.float32,
+                )
+                output = torch.full(
+                    (lengths.numel(), topk),
+                    -77,
+                    device=device,
+                    dtype=torch.int32,
+                )
+
+                persistent_topk(
+                    logits,
+                    lengths,
+                    output,
+                    workspace,
+                    topk,
+                    int(lengths.max().item()),
+                )
+                torch.cuda.synchronize()
+
+                self._assert_persistent_topk_matches_torch(
+                    logits, lengths, output, topk
+                )
+
+    def test_persistent_topk_cluster_pdl_is_cuda_graph_capture_safe(self):
+        if not has_persistent_topk():
+            self.skipTest("DeepSeek V4 persistent top-k op is not available")
+
+        torch.manual_seed(6794)
+        device = torch.device("cuda")
+        topk = 2048
+        workspace = torch.empty((1024 * 1024,), device=device, dtype=torch.uint8)
+
+        for stride, raw_lengths in (
+            (131072, [1024, 8192, 65537, 131071]),
+            (262144, [1024, 8192, 131073, 262143]),
+        ):
+            with self.subTest(stride=stride):
+                lengths = torch.tensor(raw_lengths, device=device, dtype=torch.int32)
+                logits = torch.randn(
+                    (lengths.numel(), stride),
+                    device=device,
+                    dtype=torch.float32,
+                )
+                output = torch.full(
+                    (lengths.numel(), topk),
+                    -77,
+                    device=device,
+                    dtype=torch.int32,
+                )
+
+                persistent_topk(logits, lengths, output, workspace, topk, stride)
+                torch.cuda.synchronize()
+
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    persistent_topk(logits, lengths, output, workspace, topk, stride)
+                for _ in range(3):
+                    graph.replay()
+                torch.cuda.synchronize()
+
+                self._assert_persistent_topk_matches_torch(
+                    logits, lengths, output, topk
+                )
+
+    def test_persistent_topk_cluster_specialization_boundaries(self):
+        if not has_persistent_topk():
+            self.skipTest("DeepSeek V4 persistent top-k op is not available")
+
+        torch.manual_seed(6795)
+        device = torch.device("cuda")
+        topk = 2048
+        workspace = torch.empty((1024 * 1024,), device=device, dtype=torch.uint8)
+
+        # Exercise both sides of the register-cluster and cluster-16 ceilings,
+        # including the portable cluster-8 fallback above 256K.
+        for max_seq_len in (65537, 131072, 131073, 262144, 262145):
+            with self.subTest(max_seq_len=max_seq_len):
+                actual_len = max_seq_len - 1
+                lengths = torch.tensor([actual_len], device=device, dtype=torch.int32)
+                logits = torch.randn(
+                    (1, max_seq_len), device=device, dtype=torch.float32
+                )
+                logits[:, actual_len:] = 1.0e6
+                output = torch.full((1, topk), -77, device=device, dtype=torch.int32)
+
+                persistent_topk(
+                    logits,
+                    lengths,
+                    output,
+                    workspace,
+                    topk,
+                    max_seq_len,
+                )
+                torch.cuda.synchronize()
+
+                self._assert_persistent_topk_matches_torch(
+                    logits, lengths, output, topk
+                )
+
+    def test_persistent_topk_verify_mode_uses_causal_request_lengths(self):
+        if not has_persistent_topk():
+            self.skipTest("DeepSeek V4 persistent top-k op is not available")
+
+        torch.manual_seed(6793)
+        device = torch.device("cuda")
+        topk = 512
+        q_len_per_req = 4
+        request_lengths = torch.tensor(
+            [70000, 131071], device=device, dtype=torch.int32
+        )
+        effective_lengths = torch.tensor(
+            [
+                int(raw_len) - (q_len_per_req - 1) + query_idx
+                for raw_len in request_lengths.cpu().tolist()
+                for query_idx in range(q_len_per_req)
+            ],
+            device=device,
+            dtype=torch.int32,
+        )
+        stride = 131072
+        logits = torch.randn(
+            (effective_lengths.numel(), stride),
+            device=device,
+            dtype=torch.float32,
+        )
+        output = torch.full(
+            (effective_lengths.numel(), topk),
+            -77,
+            device=device,
+            dtype=torch.int32,
+        )
+        workspace = torch.empty((1024 * 1024,), device=device, dtype=torch.uint8)
+
+        persistent_topk(
+            logits,
+            request_lengths,
+            output,
+            workspace,
+            topk,
+            int(request_lengths.max().item()),
+            q_len_per_req,
+        )
+        torch.cuda.synchronize()
+
+        self._assert_persistent_topk_matches_torch(
+            logits, effective_lengths, output, topk
+        )
 
     def test_indexer_mxfp4_cache_matches_reference(self):
         torch.manual_seed(7890)
@@ -1470,6 +1923,44 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             )
         )
 
+    def test_indexer_q_serial_four_block_is_bitwise_equal_at_production_shape(self):
+        if torch.cuda.get_device_capability() != (10, 0):
+            self.skipTest("exact serial-four-block specialization requires SM100")
+        torch.manual_seed(9125)
+        device = torch.device("cuda")
+        num_tokens = 8192
+        num_heads = 64
+        positions = torch.arange(num_tokens, device=device, dtype=torch.int64)
+        cos_sin = torch.randn(num_tokens, ROPE_DIM, device=device, dtype=torch.float32)
+        q = torch.randn(num_tokens, num_heads, 128, device=device, dtype=torch.bfloat16)
+        weights = torch.randn(num_tokens, num_heads, device=device, dtype=torch.float32)
+
+        baseline = dsv4_fused_indexer_q_rope_hadamard_mxfp4(
+            index_q=q,
+            positions=positions,
+            cos_sin_cache=cos_sin,
+            weights=weights,
+            softmax_scale=0.25,
+            head_scale=num_heads**-0.5,
+            prefer_serial_four_block=False,
+        )
+        serial = dsv4_fused_indexer_q_rope_hadamard_mxfp4(
+            index_q=q,
+            positions=positions,
+            cos_sin_cache=cos_sin,
+            weights=weights,
+            softmax_scale=0.25,
+            head_scale=num_heads**-0.5,
+            prefer_serial_four_block=True,
+        )
+        torch.cuda.synchronize()
+
+        (baseline_packed, baseline_scales), baseline_weights = baseline
+        (serial_packed, serial_scales), serial_weights = serial
+        self.assertTrue(torch.equal(serial_packed, baseline_packed))
+        self.assertTrue(torch.equal(serial_scales, baseline_scales))
+        self.assertTrue(torch.equal(serial_weights, baseline_weights))
+
     def test_sparse_prefill_combine_topk_swa_indices_matches_reference(self):
         device = torch.device("cuda")
         topk_indices = torch.tensor(
@@ -1665,6 +2156,93 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             compact_lens.cpu(), actual_lens.cpu(), atol=0, rtol=0
         )
 
+    def test_decode_dense_compressed_indices_and_lens_matches_reference(self):
+        device = torch.device("cuda")
+        positions = torch.tensor([5, 9], device=device, dtype=torch.int64)
+        token_to_req_indices = torch.tensor([0, 1], device=device, dtype=torch.int32)
+        block_table = torch.tensor(
+            [[10, 11], [20, 21]],
+            device=device,
+            dtype=torch.int32,
+        )
+        out_indices = torch.full((2, 8), -123, device=device, dtype=torch.int32)
+        out_lens = torch.empty((2,), device=device, dtype=torch.int32)
+
+        actual, actual_lens = dsv4_decode_dense_compressed_indices_and_lens(
+            positions=positions,
+            token_to_req_indices=token_to_req_indices,
+            block_table=block_table,
+            block_size=4,
+            compress_ratio=2,
+            width=8,
+            block_table_base_offsets=None,
+            is_valid_token=None,
+            out_indices=out_indices,
+            out_lens=out_lens,
+        )
+        torch.cuda.synchronize()
+
+        self.assertEqual(actual.data_ptr(), out_indices.data_ptr())
+        self.assertEqual(actual_lens.data_ptr(), out_lens.data_ptr())
+        self.assertTrue(
+            torch.equal(
+                actual.cpu(),
+                torch.tensor(
+                    [
+                        [40, 41, 42, -1, -1, -1, -1, -1],
+                        [80, 81, 82, 83, 84, -1, -1, -1],
+                    ],
+                    dtype=torch.int32,
+                ),
+            )
+        )
+        self.assertTrue(
+            torch.equal(actual_lens.cpu(), torch.tensor([3, 5], dtype=torch.int32))
+        )
+
+    def test_decode_dense_compressed_indices_masks_invalid_and_compact_pages(self):
+        device = torch.device("cuda")
+        positions = torch.tensor([9, 9], device=device, dtype=torch.int64)
+        token_to_req_indices = torch.tensor([0, 1], device=device, dtype=torch.int32)
+        is_valid_token = torch.tensor([True, False], device=device)
+        compact_table = torch.tensor(
+            [[11], [21]],
+            device=device,
+            dtype=torch.int32,
+        )
+
+        actual, actual_lens = dsv4_decode_dense_compressed_indices_and_lens(
+            positions=positions,
+            token_to_req_indices=token_to_req_indices,
+            block_table=compact_table,
+            block_size=4,
+            compress_ratio=2,
+            width=8,
+            block_table_base_offsets=torch.tensor(
+                [1, 1], device=device, dtype=torch.int32
+            ),
+            is_valid_token=is_valid_token,
+            out_indices=None,
+            out_lens=None,
+        )
+        torch.cuda.synchronize()
+
+        self.assertTrue(
+            torch.equal(
+                actual.cpu(),
+                torch.tensor(
+                    [
+                        [-1, -1, -1, -1, 44, -1, -1, -1],
+                        [-1, -1, -1, -1, -1, -1, -1, -1],
+                    ],
+                    dtype=torch.int32,
+                ),
+            )
+        )
+        self.assertTrue(
+            torch.equal(actual_lens.cpu(), torch.tensor([5, 0], dtype=torch.int32))
+        )
+
     def test_decode_swa_indices_and_lens_masks_invalid_tokens(self):
         device = torch.device("cuda")
         query_start_loc = torch.tensor([0, 1, 2], device=device, dtype=torch.int32)
@@ -1830,6 +2408,222 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             )
         )
         self.assertTrue(torch.equal(out[5:].cpu(), torch.full((3,), -1)))
+
+    def test_grouped_compressed_slot_mapping_matches_full_table_reference(self):
+        device = torch.device("cuda")
+        token_to_req_indices = torch.tensor(
+            [0, 0, 0, 1, 1, -1], device=device, dtype=torch.int32
+        )
+        query_start_loc = torch.tensor([0, 3, 5], device=device, dtype=torch.int32)
+        seq_lens = torch.tensor([264, 520], device=device, dtype=torch.int32)
+        block_table = torch.tensor(
+            [[10, 20, 21], [30, 40, -1]], device=device, dtype=torch.int32
+        )
+        is_valid_token = torch.tensor(
+            [True, True, True, True, False, True], device=device, dtype=torch.bool
+        )
+        out = torch.full((8,), 1234, device=device, dtype=torch.int64)
+
+        actual = dsv4_compact_compressed_slot_mapping(
+            num_tokens=6,
+            token_to_req_indices=token_to_req_indices,
+            query_start_loc=query_start_loc,
+            seq_lens=seq_lens,
+            block_table=block_table,
+            block_size=64,
+            compress_ratio=4,
+            block_table_base_offsets=None,
+            is_valid_token=is_valid_token,
+            out=out,
+        )
+        torch.cuda.synchronize()
+
+        self.assertEqual(actual.data_ptr(), out.data_ptr())
+        self.assertTrue(
+            torch.equal(
+                actual.cpu(),
+                torch.tensor([-1, -1, 20 * 64 + 1, -1, -1, -1]),
+            )
+        )
+        self.assertTrue(torch.equal(out[6:].cpu(), torch.full((2,), -1)))
+
+    def test_grouped_compressed_slot_mapping_compact_table_graph_replay(self):
+        device = torch.device("cuda")
+        token_to_req_indices = torch.tensor(
+            [0, 0, 0, 1, 1, -1], device=device, dtype=torch.int32
+        )
+        query_start_loc = torch.tensor([0, 3, 5], device=device, dtype=torch.int32)
+        seq_lens = torch.tensor([264, 520], device=device, dtype=torch.int32)
+        block_table = torch.tensor(
+            [[20, 21], [30, -1]], device=device, dtype=torch.int32
+        )
+        base_offsets = torch.tensor([1, 2], device=device, dtype=torch.int32)
+        is_valid_token = torch.tensor(
+            [True, True, True, True, False, True], device=device, dtype=torch.bool
+        )
+        out = torch.full((8,), 1234, device=device, dtype=torch.int64)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            dsv4_compact_compressed_slot_mapping(
+                num_tokens=6,
+                token_to_req_indices=token_to_req_indices,
+                query_start_loc=query_start_loc,
+                seq_lens=seq_lens,
+                block_table=block_table,
+                block_size=64,
+                compress_ratio=4,
+                block_table_base_offsets=base_offsets,
+                is_valid_token=is_valid_token,
+                out=out,
+            )
+        seq_lens.copy_(torch.tensor([268, 524], device=device, dtype=torch.int32))
+        block_table[0, 0] = 22
+        is_valid_token[4] = True
+        graph.replay()
+        torch.cuda.synchronize()
+
+        self.assertTrue(
+            torch.equal(
+                out[:6].cpu(),
+                torch.tensor([-1, -1, 22 * 64 + 2, -1, 30 * 64 + 2, -1]),
+            )
+        )
+        self.assertTrue(torch.equal(out[6:].cpu(), torch.full((2,), -1)))
+
+    def test_group_slot_mapping_matches_reference_and_replay(self):
+        device = torch.device("cuda")
+        positions = torch.tensor(
+            [0, 63, 64, 255, 256, 511, -1, 64],
+            device=device,
+            dtype=torch.int64,
+        )
+        req_indices = torch.tensor([0, 0, 1, -1], device=device, dtype=torch.int32)
+        block_table = torch.tensor(
+            [[10, 11], [20, -1]], device=device, dtype=torch.int32
+        )
+        base_offsets = torch.tensor([0, 1], device=device, dtype=torch.int32)
+        is_valid_token = torch.tensor(
+            [True, True, True, False], device=device, dtype=torch.bool
+        )
+
+        actual = dsv4_group_slot_mapping(
+            positions=positions,
+            req_indices=req_indices,
+            block_table=block_table,
+            rows_per_block=64,
+            entry_stride_tokens=4,
+            base_offsets=base_offsets,
+            is_valid_token=is_valid_token,
+        )
+        torch.cuda.synchronize()
+        expected = torch.tensor(
+            [640, 655, 656, 703, 1280, 1343, -1, -1], dtype=torch.int64
+        )
+        self.assertTrue(torch.equal(actual.cpu(), expected))
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            replayed = dsv4_group_slot_mapping(
+                positions=positions,
+                req_indices=req_indices,
+                block_table=block_table,
+                rows_per_block=64,
+                entry_stride_tokens=4,
+                base_offsets=base_offsets,
+                is_valid_token=is_valid_token,
+            )
+        block_table[0, 0] = 12
+        is_valid_token[2] = False
+        graph.replay()
+        torch.cuda.synchronize()
+        self.assertTrue(
+            torch.equal(
+                replayed.cpu(),
+                torch.tensor([768, 783, 784, 831, -1, -1, -1, -1]),
+            )
+        )
+
+    def test_group_slot_mapping_rejects_non_expanding_request_shape(self):
+        with self.assertRaisesRegex(ValueError, "evenly expand"):
+            dsv4_group_slot_mapping(
+                positions=torch.arange(5, device="cuda", dtype=torch.int64),
+                req_indices=torch.tensor([0, 1], device="cuda", dtype=torch.int32),
+                block_table=torch.tensor(
+                    [[10], [20]], device="cuda", dtype=torch.int32
+                ),
+                rows_per_block=64,
+                entry_stride_tokens=1,
+                base_offsets=None,
+                is_valid_token=None,
+            )
+
+    def test_group_slot_mapping_accepts_empty_decode_batch(self):
+        actual = dsv4_group_slot_mapping(
+            positions=torch.empty(0, device="cuda", dtype=torch.int64),
+            req_indices=torch.empty(0, device="cuda", dtype=torch.int32),
+            block_table=torch.empty((0, 0), device="cuda", dtype=torch.int32),
+            rows_per_block=64,
+            entry_stride_tokens=1,
+            base_offsets=None,
+            is_valid_token=None,
+        )
+
+        self.assertEqual(tuple(actual.shape), (0,))
+        self.assertEqual(actual.dtype, torch.int64)
+
+    def test_validate_active_cache_pages_matches_contract_and_replay(self):
+        device = torch.device("cuda")
+        seq_lens = torch.tensor([0, 1, 64, 129], dtype=torch.int32, device=device)
+        block_table = torch.tensor(
+            [[0, 0, 0], [3, 0, 0], [4, 0, 0], [5, 6, 7]],
+            dtype=torch.int32,
+            device=device,
+        )
+        out = torch.empty(1, dtype=torch.bool, device=device)
+        actual = dsv4_validate_active_cache_pages(
+            seq_lens=seq_lens,
+            block_table=block_table,
+            actual_bs=4,
+            raw_tokens_per_page=64,
+            max_page_id=7,
+            out=out,
+        )
+        torch.cuda.synchronize()
+        self.assertIs(actual, out)
+        self.assertTrue(bool(actual.item()))
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            replayed = dsv4_validate_active_cache_pages(
+                seq_lens=seq_lens,
+                block_table=block_table,
+                actual_bs=4,
+                raw_tokens_per_page=64,
+                max_page_id=7,
+                out=out,
+            )
+        self.assertIs(replayed, out)
+        for mutation in (
+            lambda: seq_lens.__setitem__(1, -1),
+            lambda: seq_lens.__setitem__(3, 193),
+            lambda: block_table.__setitem__((3, 2), 0),
+            lambda: block_table.__setitem__((3, 2), 8),
+        ):
+            seq_lens.copy_(
+                torch.tensor([0, 1, 64, 129], dtype=torch.int32, device=device)
+            )
+            block_table.copy_(
+                torch.tensor(
+                    [[0, 0, 0], [3, 0, 0], [4, 0, 0], [5, 6, 7]],
+                    dtype=torch.int32,
+                    device=device,
+                )
+            )
+            mutation()
+            graph.replay()
+            torch.cuda.synchronize()
+            self.assertFalse(bool(replayed.item()))
 
     def test_sparse_prefill_dequantize_and_gather_matches_reference(self):
         torch.manual_seed(9234)

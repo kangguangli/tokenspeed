@@ -35,6 +35,7 @@ from tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads import (
     sample_dspark_block_greedy,
 )
 from tokenspeed.runtime.utils.nvtx import nvtx_range
+from tokenspeed.runtime.utils.spec_block_geometry import validate_block_widths
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
@@ -86,7 +87,6 @@ class DeepseekV4DSpark(BaseDrafter):
         spec_num_tokens: int,
         spec_num_steps: int,
         draft_model_runner: ModelRunner | None = None,
-        cache_view=None,
         attn_backend=None,
         token_to_kv_pool=None,
         runtime_states: RuntimeStates | None = None,
@@ -99,7 +99,6 @@ class DeepseekV4DSpark(BaseDrafter):
             draft_model_runner=draft_model_runner,
             runtime_states=runtime_states,
             input_buffers=input_buffers,
-            cache_view=cache_view,
             attn_backend=attn_backend,
             token_to_kv_pool=token_to_kv_pool,
             vocab_size=vocab_size,
@@ -112,16 +111,9 @@ class DeepseekV4DSpark(BaseDrafter):
         self.draft_model = draft_model_runner.model
         self.model = self.draft_model.model
         self.block_size = int(self.model.block_size)
-        if int(spec_num_tokens) != self.block_size + 1:
-            raise ValueError(
-                "DSPARK verify width must equal checkpoint block_size + 1; "
-                f"got verify_width={spec_num_tokens}, block_size={self.block_size}."
-            )
-        if int(spec_num_steps) != self.block_size:
-            raise ValueError(
-                "DSPARK speculative steps must equal checkpoint block_size; "
-                f"got steps={spec_num_steps}, block_size={self.block_size}."
-            )
+        validate_block_widths(
+            "DSPARK", self.block_size, spec_num_steps, spec_num_tokens
+        )
         self.target_layer_ids = list(self.model.target_layer_ids)
         self.hidden_width = len(self.target_layer_ids) * int(self.model.hidden_size)
         self.idle_forward_steps = 1
@@ -192,7 +184,7 @@ class DeepseekV4DSpark(BaseDrafter):
 
     def wire_target(self, target_model) -> None:
         self.target_model = target_model
-        self.lm_head = target_model.lm_head
+        self.lm_head = self.draft_model.lm_head
         self.tp_group = target_model.logits_processor.tp_group
         if not hasattr(target_model, "set_dspark_layers_to_capture"):
             raise ValueError(
@@ -208,6 +200,12 @@ class DeepseekV4DSpark(BaseDrafter):
         num_extends: int,
     ) -> None:
         """Refresh request-to-window slots outside CUDA Graph replay."""
+
+        if hasattr(self, "lm_head"):
+            self.model.refresh_local_base_logits_head(
+                self.lm_head.weight,
+                force=False,
+            )
 
         if len(request_ids) != len(request_pool_indices):
             raise ValueError("DSPARK request IDs and pool indices must align.")
@@ -252,6 +250,13 @@ class DeepseekV4DSpark(BaseDrafter):
         if active_bs < self.input_buffers.max_bs:
             self.slot_indices_buf[active_bs:].copy_(self.padding_slots[active_bs:])
 
+    def on_target_weights_updated(self) -> None:
+        """Refresh target-derived weights after an in-place target reload."""
+        self.model.refresh_local_base_logits_head(
+            self.lm_head.weight,
+            force=True,
+        )
+
     @staticmethod
     def _bonus_tokens_from_output(
         output_tokens: torch.Tensor,
@@ -278,16 +283,6 @@ class DeepseekV4DSpark(BaseDrafter):
             )
             out[num_extends:].copy_(output_tokens[offsets + accepted - 1])
         return out
-
-    def get_candidates(self, base_ctx: ForwardContext) -> torch.Tensor | None:
-        num_decodes = base_ctx.bs - base_ctx.num_extends
-        if num_decodes <= 0:
-            return None
-        decode_tokens = num_decodes * self.spec_num_tokens
-        prefill_tokens = base_ctx.input_num_tokens - decode_tokens
-        return self.input_buffers.input_ids_buf[
-            prefill_tokens : base_ctx.input_num_tokens
-        ].reshape(num_decodes, self.spec_num_tokens)
 
     def _seed_prefill_windows(
         self,
@@ -417,7 +412,7 @@ class DeepseekV4DSpark(BaseDrafter):
             slots,
             draft_ctx,
         )
-        local_logits = self.model.local_base_logits(draft_hidden, self.lm_head)
+        local_logits = self.model.local_base_logits(draft_hidden, None)
         sample_dspark_block_greedy(
             local_logits,
             bonus,

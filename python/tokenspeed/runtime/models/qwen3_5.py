@@ -34,6 +34,7 @@ from tokenspeed_kernel.ops.layernorm.triton import (
     fused_qk_rmsnorm_rope_gate,
     qk_rmsnorm,
 )
+from tokenspeed_kernel.platform import pdl_enabled
 
 from tokenspeed.runtime.configs.qwen3_5_config import (
     Qwen3_5Config,
@@ -46,11 +47,6 @@ from tokenspeed.runtime.configs.utils import get_rope_parameters
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
-
-# Configs
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-    FULL_ATTENTION,
-)
 
 # Layers - Attention
 from tokenspeed.runtime.layers.attention.linear.layernorm_gated import (
@@ -103,7 +99,7 @@ from tokenspeed.runtime.multimodal.embedder import (
     pad_input_tokens,
 )
 from tokenspeed.runtime.multimodal.encoder_cudagraph import (
-    EncoderCudaGraphWrapper,
+    EncoderForwardStepRunner,
     VisionEncoderCudaGraphAdapter,
 )
 from tokenspeed.runtime.multimodal.inputs import (
@@ -121,7 +117,36 @@ from tokenspeed.runtime.utils.env import envs
 logger = logging.getLogger(__name__)
 
 
-def _gdn_group_unquantized(prefix, shard_names, ignored_layers) -> bool:
+def _is_ignored_checkpoint_param(model, name: str) -> bool:
+    """Whether ``name`` is a checkpoint tensor the owning module's quant method
+    deliberately does not consume (e.g. a residual A16 ``input_scale``).
+
+    The decision is owned by the layer's quant method via its
+    ``ignored_checkpoint_params`` attribute, so a method that genuinely uses the
+    tensor (e.g. static FP8 ``input_scale``) still loads it.
+    """
+    parent, _, leaf = name.rpartition(".")
+    if not parent:
+        return False
+    try:
+        module = model.get_submodule(parent)
+    except AttributeError:
+        return False
+    quant_method = getattr(module, "quant_method", None)
+    return leaf in getattr(quant_method, "ignored_checkpoint_params", ())
+
+
+def _gdn_group_unquantized(prefix, shard_names, quant_config) -> bool:
+    is_quantized_layer = getattr(quant_config, "is_quantized_layer", None)
+    if is_quantized_layer is not None:
+        quantized = {is_quantized_layer(f"{prefix}.{shard}") for shard in shard_names}
+        if len(quantized) > 1:
+            raise ValueError(
+                f"Partially quantized Gated DeltaNet projection group at {prefix}"
+            )
+        return not quantized.pop()
+
+    ignored_layers = getattr(quant_config, "ignored_layers", None) or []
     if not ignored_layers:
         return False
     targets = list(ignored_layers)
@@ -195,12 +220,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
 
-        ignored_layers = getattr(quant_config, "ignored_layers", None) or []
         qkvz_unquant = _gdn_group_unquantized(
-            prefix, ("in_proj_qkv", "in_proj_z"), ignored_layers
+            prefix, ("in_proj_qkv", "in_proj_z"), quant_config
         )
         ba_unquant = _gdn_group_unquantized(
-            prefix, ("in_proj_b", "in_proj_a"), ignored_layers
+            prefix, ("in_proj_b", "in_proj_a"), quant_config
         )
         self._split_in_proj = quant_config is not None and (qkvz_unquant != ba_unquant)
         if self._split_in_proj:
@@ -401,23 +425,26 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 )
 
                 if len(loaded_weight.shape) == 0:
-                    # Scalar only makes sense for a single logical shard.
-                    if len(split_sizes) != 1 or split_sizes[0] != 1:
+                    # A per-tensor scalar (FP8 weight_scale / input_scale) from
+                    # a checkpoint module fused across one or more runtime
+                    # shards (e.g. in_proj_qkv -> qkvz shards (0, 1, 2)). Every
+                    # shard slot receives the same single checkpoint scale.
+                    if any(size != 1 for size in split_sizes):
                         raise ValueError(
                             f"Unexpected scalar for tuple shard load: "
                             f"{loaded_shard_id=}, {split_sizes=}"
                         )
-                    chunks = [loaded_weight.reshape(1)]
-                else:
-                    split_dim = getattr(param, "output_dim", 0)
-                    chunks = loaded_weight.split(split_sizes, dim=split_dim)
+                    for idx in loaded_shard_id:
+                        original_weight_loader(param, loaded_weight.reshape(1), idx)
+                    return
 
+                split_dim = getattr(param, "output_dim", 0)
+                chunks = loaded_weight.split(split_sizes, dim=split_dim)
                 if len(chunks) != len(loaded_shard_id):
                     raise ValueError(
                         f"Chunk/shard mismatch: {len(chunks)=}, "
                         f"{len(loaded_shard_id)=}, {split_sizes=}"
                     )
-
                 for idx, chunk in zip(loaded_shard_id, chunks):
                     # Delegate each chunk to the param's original int-shard loader.
                     original_weight_loader(param, chunk, idx)
@@ -515,7 +542,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             k=None,
             v=None,
             layer=None,
-            out_cache_loc=None,
             token_to_kv_pool=ctx.token_to_kv_pool,
             forward_mode=ctx.forward_mode,
             bs=ctx.bs,
@@ -743,7 +769,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            group_id=FULL_ATTENTION,
         )
 
         # Dense MLP for non-MoE variant
@@ -838,10 +863,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         v: torch.Tensor,
         gate: torch.Tensor | None,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
     ) -> torch.Tensor:
         """Backend attention call + optional gate apply. Subclasses override."""
-        attn_output = self.attn(q, k, v, ctx, out_cache_loc)
+        attn_output = self.attn(q, k, v, ctx)
         if gate is not None:
             sigmoid_mul(attn_output, gate)
         return attn_output
@@ -851,11 +875,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
     ) -> torch.Tensor:
         """Full attention forward pass."""
         q, k, v, gate = self._project_qkv_rope(positions, hidden_states)
-        attn_output = self._attn(q, k, v, gate, ctx, out_cache_loc)
+        attn_output = self._attn(q, k, v, gate, ctx)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -873,7 +896,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         **kwargs,
     ):
         num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
@@ -889,7 +911,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
                 ctx=ctx,
-                out_cache_loc=out_cache_loc,
             )
             residual = self._maybe_narrow_residual(residual, ctx)
             hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
@@ -991,10 +1012,8 @@ class Qwen3_5ForCausalLM(nn.Module):
         # *input* hidden states are captured. Populated by
         # set_eagle3_layers_to_capture() / set_dflash_layers_to_capture().
         self.layers_to_capture: set = set()
-        self._dflash_incremental_callback = None
-        self._dflash_slot_bufs = None
-        self._dflash_capture_idx_map = {}
-        self._dflash_incr_active = False
+        # DFLASH: each capture layer's positional tap index.
+        self._dflash_capture_idx_map: dict[int, int] = {}
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
@@ -1005,7 +1024,6 @@ class Qwen3_5ForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
         pp_proxy_tensors=None,
         input_deepstack_embeds: torch.Tensor | None = None,
@@ -1040,15 +1058,8 @@ class Qwen3_5ForCausalLM(nn.Module):
                 )
                 gathered = layer.comm_manager.gather_residual(aux, ctx)
                 capture_idx = self._dflash_capture_idx_map.get(layer_idx)
-                if (
-                    self._dflash_incr_active
-                    and self._dflash_incremental_callback is not None
-                    and self._dflash_slot_bufs is not None
-                    and capture_idx is not None
-                ):
-                    num_tokens = gathered.shape[0]
-                    self._dflash_slot_bufs[capture_idx][:num_tokens].copy_(gathered)
-                    self._dflash_incremental_callback(capture_idx, num_tokens)
+                if ctx.target_capture_sink is not None and capture_idx is not None:
+                    ctx.target_capture_sink.on_target_capture(capture_idx, gathered)
                 aux_hidden_states.append(
                     gathered if gathered is aux else gathered.clone()
                 )
@@ -1060,7 +1071,6 @@ class Qwen3_5ForCausalLM(nn.Module):
                     hidden_states=hidden_states,
                     residual=residual,
                     ctx=ctx,
-                    out_cache_loc=out_cache_loc,
                 )
 
             # Process deepstack embeddings if provided
@@ -1417,7 +1427,7 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             capture_tp_size=mapping.vision.tp_size,
             capture_tp_group=mapping.vision.tp_group,
         )
-        return EncoderCudaGraphWrapper(
+        return EncoderForwardStepRunner(
             adapter=adapter,
             budget_range=(64, 4096),
             max_metadata_sequences_per_batch=max_metadata_sequences_per_batch,
@@ -1452,12 +1462,7 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
-    def set_dflash_layers_to_capture(
-        self,
-        layer_ids: list[int],
-        incremental_callback=None,
-        slot_bufs: list | None = None,
-    ) -> None:
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
         # DFLASH checkpoints name 0-indexed target layer outputs. The capture
         # check runs before layer i, so capture at i + 1 for layer i's output.
         num_layers = len(self.model.layers)
@@ -1475,8 +1480,6 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
         self.model._dflash_capture_idx_map = {
             layer_idx: i for i, layer_idx in enumerate(sorted_capture_layers)
         }
-        self.model._dflash_incremental_callback = incremental_callback
-        self.model._dflash_slot_bufs = slot_bufs
 
     @torch.no_grad()
     def forward(
@@ -1484,7 +1487,6 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
         ctx: ForwardContext,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
         multimodal_context = kwargs.pop("multimodal_context", None)
@@ -1497,7 +1499,6 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
                 ctx,
                 input_ids,
                 positions,
-                out_cache_loc,
                 **kwargs,
             )
 
@@ -1512,7 +1513,6 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             input_ids,
             positions,
             ctx,
-            out_cache_loc,
             input_embeds=input_embeds,
             **model_kwargs,
         )
@@ -1584,6 +1584,8 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 if name not in params_dict:
+                    if _is_ignored_checkpoint_param(self, name):
+                        break
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader")
@@ -1597,12 +1599,15 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 if name not in params_dict:
+                    if _is_ignored_checkpoint_param(self, name):
+                        continue
                     logger.warning("Parameter %s not found in params_dict", name)
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
+
         return loaded_params
 
 
@@ -1794,110 +1799,53 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
     a,
     mixed_qkvz,
     mixed_ba,
-    stride_qkvz,
-    stride_ba,
+    stride_qkvz: tl.constexpr,
+    stride_ba: tl.constexpr,
     NUM_HEADS_QK: tl.constexpr,
     NUM_HEADS_V: tl.constexpr,
     HEAD_QK: tl.constexpr,
     HEAD_V: tl.constexpr,
+    BLOCK: tl.constexpr,
+    BLOCK_BA: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
-    i_bs, i_qk = tl.program_id(0), tl.program_id(1)
-
-    V_PER_GROUP: tl.constexpr = NUM_HEADS_V // NUM_HEADS_QK
-
-    # ── Input dimensions ──
-    TOTAL_Q: tl.constexpr = NUM_HEADS_QK * HEAD_QK
-    TOTAL_K: tl.constexpr = NUM_HEADS_QK * HEAD_QK
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+    row, tile = tl.program_id(0), tl.program_id(1)
     TOTAL_V: tl.constexpr = NUM_HEADS_V * HEAD_V
-
-    # ── Output dimensions ──
-    QKV_DIM_T: tl.constexpr = TOTAL_Q + TOTAL_K + TOTAL_V
-
-    # ── Read from input (supports non-contiguous stride) ──
-    # q for head group i_qk: in the all_q region, offset i_qk * HEAD_QK
-    blk_q_ptr = mixed_qkvz + i_bs * stride_qkvz + i_qk * HEAD_QK + tl.arange(0, HEAD_QK)
-    # k for head group i_qk: in the all_k region
-    blk_k_ptr = (
-        mixed_qkvz
-        + i_bs * stride_qkvz
-        + TOTAL_Q
-        + i_qk * HEAD_QK
-        + tl.arange(0, HEAD_QK)
+    QKV_DIM: tl.constexpr = 2 * NUM_HEADS_QK * HEAD_QK + TOTAL_V
+    QKVZ_DIM: tl.constexpr = QKV_DIM + TOTAL_V
+    # QKVZ is already ordered, including non-power-of-two head ratios.
+    offsets = tile * BLOCK + tl.arange(0, BLOCK)
+    values = tl.load(
+        mixed_qkvz + row * stride_qkvz + offsets,
+        offsets < QKVZ_DIM,
+        other=0,
     )
-    # ── Write to output (identical layout to the interleaved kernel) ──
-    blk_q_st_ptr = mixed_qkv + i_bs * QKV_DIM_T + i_qk * HEAD_QK + tl.arange(0, HEAD_QK)
-    blk_k_st_ptr = (
-        mixed_qkv
-        + i_bs * QKV_DIM_T
-        + NUM_HEADS_QK * HEAD_QK
-        + i_qk * HEAD_QK
-        + tl.arange(0, HEAD_QK)
+    # Keep output bases separate: pointer selection breaks AMD canonicalization.
+    tl.store(
+        mixed_qkv + row * QKV_DIM + offsets,
+        values,
+        offsets < QKV_DIM,
+    )
+    tl.store(
+        z + row * TOTAL_V + offsets - QKV_DIM,
+        values,
+        (offsets >= QKV_DIM) & (offsets < QKVZ_DIM),
     )
 
-    tl.store(blk_q_st_ptr, tl.load(blk_q_ptr))
-    tl.store(blk_k_st_ptr, tl.load(blk_k_ptr))
-
-    # Compile-time branch keeps the fast
-    # vectorized path for pow2 ratios and loops per head otherwise
-    IS_POW2: tl.constexpr = (V_PER_GROUP & (V_PER_GROUP - 1)) == 0
-
-    if IS_POW2:
-        blk_v_ptr = (
-            mixed_qkvz
-            + i_bs * stride_qkvz
-            + TOTAL_Q
-            + TOTAL_K
-            + i_qk * V_PER_GROUP * HEAD_V
-            + tl.arange(0, V_PER_GROUP * HEAD_V)
+    # One tile owns each row's gates; adjacent lanes copy adjacent heads.
+    if tile == 0:
+        heads = tl.arange(0, BLOCK_BA)
+        mask = heads < NUM_HEADS_V
+        b_values = tl.load(mixed_ba + row * stride_ba + heads, mask, other=0)
+        a_values = tl.load(
+            mixed_ba + row * stride_ba + NUM_HEADS_V + heads, mask, other=0
         )
-        blk_z_ptr = (
-            mixed_qkvz
-            + i_bs * stride_qkvz
-            + TOTAL_Q
-            + TOTAL_K
-            + TOTAL_V
-            + i_qk * V_PER_GROUP * HEAD_V
-            + tl.arange(0, V_PER_GROUP * HEAD_V)
-        )
-        blk_v_st_ptr = (
-            mixed_qkv
-            + i_bs * QKV_DIM_T
-            + NUM_HEADS_QK * HEAD_QK * 2
-            + i_qk * V_PER_GROUP * HEAD_V
-            + tl.arange(0, V_PER_GROUP * HEAD_V)
-        )
-        blk_z_st_ptr = (
-            z
-            + i_bs * NUM_HEADS_V * HEAD_V
-            + i_qk * V_PER_GROUP * HEAD_V
-            + tl.arange(0, V_PER_GROUP * HEAD_V)
-        )
-        tl.store(blk_v_st_ptr, tl.load(blk_v_ptr))
-        tl.store(blk_z_st_ptr, tl.load(blk_z_ptr))
-    else:
-        for i in tl.static_range(V_PER_GROUP):
-            head_off = (i_qk * V_PER_GROUP + i) * HEAD_V + tl.arange(0, HEAD_V)
-            blk_v_ptr = mixed_qkvz + i_bs * stride_qkvz + TOTAL_Q + TOTAL_K + head_off
-            blk_z_ptr = (
-                mixed_qkvz + i_bs * stride_qkvz + TOTAL_Q + TOTAL_K + TOTAL_V + head_off
-            )
-            blk_v_st_ptr = (
-                mixed_qkv + i_bs * QKV_DIM_T + NUM_HEADS_QK * HEAD_QK * 2 + head_off
-            )
-            blk_z_st_ptr = z + i_bs * NUM_HEADS_V * HEAD_V + head_off
-            tl.store(blk_v_st_ptr, tl.load(blk_v_ptr))
-            tl.store(blk_z_st_ptr, tl.load(blk_z_ptr))
-
-    # ── b and a ──
-    for i in tl.static_range(V_PER_GROUP):
-        blk_b_ptr = mixed_ba + i_bs * stride_ba + i_qk * V_PER_GROUP + i
-        blk_b_st_ptr = b + i_bs * NUM_HEADS_V + i_qk * V_PER_GROUP + i
-        tl.store(blk_b_st_ptr, tl.load(blk_b_ptr))
-
-    for i in tl.static_range(V_PER_GROUP):
-        blk_a_ptr = mixed_ba + i_bs * stride_ba + NUM_HEADS_V + i_qk * V_PER_GROUP + i
-        blk_a_st_ptr = a + i_bs * NUM_HEADS_V + i_qk * V_PER_GROUP + i
-        tl.store(blk_a_st_ptr, tl.load(blk_a_ptr))
+        tl.store(b + row * NUM_HEADS_V + heads, b_values, mask)
+        tl.store(a + row * NUM_HEADS_V + heads, a_values, mask)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def fused_qkvzba_split_reshape_cat_contiguous(
@@ -1908,7 +1856,11 @@ def fused_qkvzba_split_reshape_cat_contiguous(
     head_qk,
     head_v,
 ):
-    """Fused split/reshape/cat for Qwen3.5. Supports non-contiguous inputs.
+    """Repack Qwen3.5 projections into contiguous, independently owned outputs.
+
+    Inputs have unit inner strides; row strides and storage offsets may vary.
+    The leading dimension counts tokens, including flattened MTP tokens.
+    QKV and Z retain the QKVZ dtype; B and A retain the BA dtype.
 
     Input layout (per row):
         mixed_qkvz: [all_q | all_k | all_v | all_z]
@@ -1920,6 +1872,7 @@ def fused_qkvzba_split_reshape_cat_contiguous(
         b: [num_v_heads]
         a: [num_v_heads]
     """
+    enable_pdl = pdl_enabled()
     batch, seq_len = mixed_qkvz.shape[0], 1
     qkv_dim_t = num_heads_qk * head_qk * 2 + num_heads_v * head_v
     mixed_qkv = torch.empty(
@@ -1938,7 +1891,7 @@ def fused_qkvzba_split_reshape_cat_contiguous(
         device=mixed_ba.device,
     )
     a = torch.empty_like(b)
-    grid = (batch * seq_len, num_heads_qk)
+    grid = (batch * seq_len, triton.cdiv(qkv_dim_t + num_heads_v * head_v, 2048))
     fused_qkvzba_split_reshape_cat_contiguous_kernel[grid](
         mixed_qkv,
         z,
@@ -1952,8 +1905,12 @@ def fused_qkvzba_split_reshape_cat_contiguous(
         num_heads_v,
         head_qk,
         head_v,
-        num_warps=1,
-        num_stages=3,
+        BLOCK=2048,
+        BLOCK_BA=triton.next_power_of_2(num_heads_v),
+        num_warps=4,
+        num_stages=1,
+        ENABLE_PDL=enable_pdl,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
     return mixed_qkv, z, b, a
 

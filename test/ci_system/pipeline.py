@@ -70,7 +70,15 @@ RUNNER_SM_PREFIXES = (
     (("b300", "gb300", "slurm-b300", "slurm-gb300"), "sm103"),
 )
 
-AMD_RUNNER_PREFIXES = ("amd-mi35x-", "amd-mi355-", "amd-mi350-", "amd-mi450-")
+AMD_RUNNER_PREFIXES = (
+    "amd-mi35x-",
+    "amd-mi355-",
+    "amd-mi350-",
+    "amd-mi450-",
+    "amd-mi45x-",
+)
+# A pool whose label names cpu instead of a GPU count holds no accelerator.
+CPU_ONLY_RUNNER_MARKER = "-cpu-"
 NVIDIA_ARM_RUNNER_PREFIXES = (
     "gb200",
     "gb300",
@@ -90,6 +98,10 @@ PERF_DIAGNOSTIC_RUNNERS = ("b300-4gpu",)
 
 def is_amd_runner(runner: str) -> bool:
     return runner.startswith(AMD_RUNNER_PREFIXES)
+
+
+def is_cpu_only_runner(runner: str) -> bool:
+    return CPU_ONLY_RUNNER_MARKER in runner
 
 
 def is_nvidia_arm_runner(runner: str) -> bool:
@@ -837,7 +849,7 @@ def setup_runner(
         )
 
     if is_amd_runner(runner):
-        if runner != "amd-mi450-sim":
+        if not is_cpu_only_runner(runner):
             # Best-effort: kill any GPU-holding processes left over by a
             # previous pod scheduled on the same node. Cluster admins flagged
             # a known race where the device plugin releases a GPU back to the
@@ -1608,7 +1620,8 @@ def poll_readiness(
             with urlopen(url, timeout=5) as response:
                 if response.status == expected_status:
                     return
-        except URLError:
+        except (URLError, ConnectionError, TimeoutError):
+            # Restarting servers can reset or stall an accepted HTTP connection.
             pass
         sleep_deadline = min(deadline, time.time() + interval_seconds)
         while time.time() < sleep_deadline:

@@ -24,12 +24,68 @@ import pytest
 import torch
 from tokenspeed_kernel.ops.kvcache.triton import (
     copy_state_rows,
+    fused_fp8_set_kv_buffer,
     index_k_block_split_scatter,
     transfer_kv_all_layer,
     transfer_kv_all_layer_mla,
     transfer_kv_per_layer,
     transfer_kv_per_layer_mla,
+    zero_byte_ranges,
 )
+
+
+@pytest.mark.parametrize("extra_ranges", [0, 60])
+def test_zero_byte_ranges_strides_and_preserves_neighbors(
+    device: str, extra_ranges: int
+) -> None:
+    # Four ranges use a 256-CTA Y cap; 64 ranges use the 32-CTA cap.
+    # The largest payload extends three bytes past three 256-KiB spans,
+    # exercising repeated loop iterations and a partial final tile.
+    ranges = [(3, 7), (31, 27648), (30003, 73729), (110001, 786435)]
+    ranges.extend((900001 + i * 16, 3) for i in range(extra_ranges))
+    backing = torch.full((901025,), 173, dtype=torch.uint8, device=device)
+    expected = torch.full((901025,), 173, dtype=torch.uint8, device="cpu")
+    for offset, size in ranges:
+        expected[offset : offset + size] = 0
+
+    zero_byte_ranges(backing, ranges)
+
+    # Compare every byte, including leading/trailing guards and inter-range gaps.
+    torch.testing.assert_close(backing.cpu(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("tokens", [1, 4, 32])
+def test_fused_fp8_set_kv_buffer_matches_qsa_store(device: str, tokens: int) -> None:
+    torch.manual_seed(tokens)
+    page_size, num_slots = 16, 64
+    # Match Qwen4-Exp TP4: Q/Gate precede one 256-wide K and V in the GEMM
+    # output, so both inputs are strided views rather than contiguous tensors.
+    qkv = torch.randn((tokens, 3584), device=device, dtype=torch.bfloat16)
+    k = qkv[:, 3072:3328].view(tokens, 1, 256)
+    v = qkv[:, 3328:3584].view(tokens, 1, 256)
+    assert k.stride(-1) == v.stride(-1) == 1
+    if tokens > 1:
+        assert k.stride(0) == qkv.stride(0) == v.stride(0)
+    cache_locs = torch.randperm(num_slots, device=device)[:tokens].to(torch.int32)
+    k_cache = torch.zeros((num_slots, 1, 256), device=device, dtype=torch.float8_e4m3fn)
+    v_cache = torch.zeros_like(k_cache)
+    expected_k = torch.zeros_like(k_cache)
+    expected_v = torch.zeros_like(v_cache)
+    expected_k[cache_locs.to(torch.long)] = k.to(torch.float8_e4m3fn)
+    expected_v[cache_locs.to(torch.long)] = v.to(torch.float8_e4m3fn)
+
+    fused_fp8_set_kv_buffer(
+        k,
+        v,
+        k_cache,
+        v_cache,
+        cache_locs,
+        page_size=page_size,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(k_cache.view(torch.uint8), expected_k.view(torch.uint8))
+    assert torch.equal(v_cache.view(torch.uint8), expected_v.view(torch.uint8))
 
 
 @pytest.mark.parametrize(

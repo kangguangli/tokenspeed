@@ -26,10 +26,9 @@ import math
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from functools import cached_property
 from itertools import pairwise
 from typing import TYPE_CHECKING
-
-import torch
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
@@ -124,8 +123,8 @@ MXFP8_KV_SCALE_TILE_TOKENS = 128
 MXFP8_SCALE_BLOCK_SIZE = 32
 
 
-def cache_field_layer_id(field_id: str) -> int:
-    """Return the owning model layer encoded in a cache field ID."""
+def _split_cache_field_id(field_id: str) -> tuple[int, str]:
+    """Split ``layer.<id>.<plane>`` into its owning layer and plane name."""
     parts = field_id.split(".", 2)
     if len(parts) != 3 or parts[0] != "layer":
         raise ValueError(f"cache field {field_id!r} is not owned by a model layer")
@@ -135,7 +134,17 @@ def cache_field_layer_id(field_id: str) -> int:
         raise ValueError(f"cache field {field_id!r} has an invalid layer id") from exc
     if layer_id < 0:
         raise ValueError(f"cache field {field_id!r} has an invalid layer id")
-    return layer_id
+    return layer_id, parts[2]
+
+
+def cache_field_layer_id(field_id: str) -> int:
+    """Return the owning model layer encoded in a cache field ID."""
+    return _split_cache_field_id(field_id)[0]
+
+
+def cache_field_plane(field_id: str) -> str:
+    """Return the per-layer plane name a cache field ID carries after its layer."""
+    return _split_cache_field_id(field_id)[1]
 
 
 @dataclass(frozen=True)
@@ -291,6 +300,56 @@ class CacheMemoryPlan:
             + page_id * field.page_stride_bytes
             + field.field_offset_bytes
         )
+
+    @cached_property
+    def _block_byte_layouts(
+        self,
+    ) -> dict[str, tuple[int, tuple[tuple[int, int, int], ...]]]:
+        """Resolve immutable field geometry once, before repeated block hand-outs."""
+        return {
+            group.group_id: (
+                group.page_count,
+                tuple(
+                    (
+                        self.field_page_byte_offset(field.field_id, 0),
+                        field.page_stride_bytes,
+                        field.payload_bytes,
+                    )
+                    for field in self.fields
+                    if field.group_id == group.group_id
+                ),
+            )
+            for group in self.groups
+        }
+
+    def block_byte_segments(
+        self, group_id: str, block_ids: list[int]
+    ) -> list[tuple[int, int]]:
+        """Return field payload ranges for blocks, preserving caller/field order.
+
+        Args:
+            group_id: The planned cache group owning the blocks.
+            block_ids: Physical group block IDs, including zero when requested.
+
+        Returns:
+            Byte offset and byte count pairs, excluding field/stride padding.
+        """
+        page_count, fields = self._block_byte_layouts[group_id]
+        for block_id in block_ids:
+            if (
+                isinstance(block_id, bool)
+                or not isinstance(block_id, int)
+                or block_id < 0
+                or block_id >= page_count
+            ):
+                raise IndexError(
+                    f"page_id {block_id} outside [0, {page_count}) for group {group_id!r}"
+                )
+        return [
+            (base + block_id * stride, size)
+            for block_id in block_ids
+            for base, stride, size in fields
+        ]
 
     def capacity_report(
         self,
@@ -458,7 +517,7 @@ def mxfp8_kv_scale_fields(
         scale_dim,
         scale_dim,
     )
-    dtype = cache_dtype_name(torch.float8_e8m0fnu)
+    dtype = cache_dtype_name("float8_e8m0fnu")
     return tuple(
         CacheFieldSpec(
             f"layer.{layer_id}.{plane}_scale",
