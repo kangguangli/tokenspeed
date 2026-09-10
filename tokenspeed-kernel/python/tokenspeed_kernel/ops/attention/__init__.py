@@ -3777,7 +3777,8 @@ def dsv4_decode(
             holes inside that prefix. Owner filtering must not shorten it when
             indices retain their original order.
         extra_page_size: Number of rows in each extra cache page.
-        out: Optional output shaped like ``q``.
+        out: Optional output buffer shaped like ``q``. When provided, the
+            returned output is this same tensor, including with return_lse=True.
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
         return_lse: Return a no-sink partial and its natural-log LSE. Requires

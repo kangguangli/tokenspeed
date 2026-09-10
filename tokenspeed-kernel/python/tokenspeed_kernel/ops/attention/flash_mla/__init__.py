@@ -412,10 +412,6 @@ if (
             block_table=None,
             cache_seqlens=None,
             head_dim_v=q.shape[-1],
-            # For each geometry, scan lengths are layer invariant in both
-            # TP and DCP, including newly sliced mixed metadata. Cache by
-            # geometry, not tensor addresses or return_lse. Reset before scan
-            # length values change; owner masking only changes the indices.
             tile_scheduler_metadata=_get_dsv4_tile_meta(
                 q_kernel,
                 swa_indices.shape[-1],
@@ -434,14 +430,6 @@ if (
         )
         if result.dim() == 4:
             result = result.squeeze(1)
-        if return_lse:
-            # FlashMLA reports natural-log LSE excluding the sink. Its usual
-            # sink-scaled output would not be a compatible partial, hence the
-            # explicit no-sink gate above. DCP owns empty-shard normalization
-            # and removing the singleton query axis from [tokens, heads, 1].
-            assert lse.dtype == torch.float32, "FlashMLA must return FP32 LSE"
-            if lse.shape != (*result.shape[:-1], 1):
-                raise ValueError("FlashMLA DCP LSE shape disagrees with output")
         if out is not None:
             out.copy_(result)
             result = out

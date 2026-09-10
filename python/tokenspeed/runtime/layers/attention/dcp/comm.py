@@ -34,41 +34,6 @@ from tokenspeed.runtime.distributed.comm_ops import (
 )
 
 
-def lse_weights(lse: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return FP32 shard weights and combined LSE for [shards, tokens, heads].
-
-    Empty shards use -inf. An entirely empty selection has zero weights and
-    LSE -inf. Unexpected NaNs in nonempty partials propagate to validation.
-    """
-    values = lse.float()
-    maximum = values.amax(dim=0)
-    safe_maximum = torch.where(maximum == -torch.inf, 0, maximum)
-    masses = torch.exp(values - safe_maximum.unsqueeze(0))
-    denominator = masses.sum(dim=0)
-    weights = masses / denominator.clamp_min(torch.finfo(torch.float32).tiny).unsqueeze(
-        0
-    )
-    combined = torch.where(denominator == 0, -torch.inf, maximum + denominator.log())
-    return weights, combined
-
-
-def apply_sink_once(
-    output: torch.Tensor, lse: torch.Tensor, sink: torch.Tensor
-) -> torch.Tensor:
-    """Scale combined no-sink FP32 output by the single TP head owner's sink."""
-    factor = torch.where(lse == -torch.inf, 0, torch.sigmoid(lse - sink.float()))
-    return output.float() * factor.unsqueeze(-1)
-
-
-def merge_partials(
-    output: torch.Tensor, lse: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Merge all shard outputs in FP32, leaving sink application to the caller."""
-    weights, combined_lse = lse_weights(lse)
-    safe_output = torch.where((lse != -torch.inf).unsqueeze(-1), output.float(), 0)
-    return (safe_output * weights.unsqueeze(-1)).sum(dim=0), combined_lse
-
-
 def gather_query_heads(query: torch.Tensor, group: tuple[int, ...]) -> torch.Tensor:
     """Gather only actual TP query heads after QNorm/RoPE; padding stays local."""
     if len(group) == 1:
@@ -93,7 +58,7 @@ def combine_attention_partials(
     """Gather LSE and reduce-scatter weighted partials to the TP head owner.
 
     Args:
-        local_output: Local context output [tokens, gathered_heads, head_dim].
+        local_output: CUDA local context output [tokens, gathered_heads, head_dim].
         local_lse: Natural-log FP32 LSE [tokens, gathered_heads].
         group: Consecutive DCP subgroup of attention TP.
         rank: This process's position in group.
@@ -112,15 +77,6 @@ def combine_attention_partials(
     if sink.numel() < heads:
         raise ValueError("DCP sink must cover the TP-local heads")
     gathered_lse = all_gather(local_lse.float().unsqueeze(0).contiguous(), group, dim=0)
-    if local_output.is_cuda:
-        weighted, lse = dcp_weight_for_reduce_scatter(local_output, gathered_lse, rank)
-        output = reduce_scatter(weighted, group).movedim(0, 1)
-        return dcp_apply_sink(output, lse, sink, dtype=local_output.dtype)
-    weights, global_lse = lse_weights(gathered_lse)
-    safe_output = torch.where(
-        (local_lse != -torch.inf).unsqueeze(-1), local_output.float(), 0
-    )
-    weighted = (safe_output * weights[rank].unsqueeze(-1)).movedim(1, 0).contiguous()
+    weighted, lse = dcp_weight_for_reduce_scatter(local_output, gathered_lse, rank)
     output = reduce_scatter(weighted, group).movedim(0, 1)
-    lse = global_lse[:, rank * heads : (rank + 1) * heads]
-    return apply_sink_once(output, lse, sink[:heads]).to(local_output.dtype)
+    return dcp_apply_sink(output, lse, sink, dtype=local_output.dtype)

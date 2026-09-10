@@ -366,13 +366,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             for group_id, count in contract.virtual_block_counts.items()
         }
 
-    def _cache_metadata_kwargs(self) -> dict:
-        return {
-            "dcp_size": self.dcp_size,
-            "dcp_rank": self.dcp_rank,
-            "runtime_contract": self.cache_pool.arena.runtime_contract,
-        }
-
     def _prepare_cache_group_tables(
         self,
         block_tables: Mapping[object, object],
@@ -1090,7 +1083,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             (1, 0),
         )
         cache_metadata = DeepseekV4CacheMetadata(
-            **self._cache_metadata_kwargs(),
+            dcp_size=self.dcp_size,
+            dcp_rank=self.dcp_rank,
+            runtime_contract=self.cache_pool.arena.runtime_contract,
             page_size=self.kernel_page_size,
             page_table=page_table,
             block_tables=block_tables,
@@ -1140,29 +1135,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 )
         elif forward_mode is not None and forward_mode.is_extend_or_mixed():
             self.forward_prefill_metadata = self.forward_metadata
-
-    def _get_decode_swa_metadata(
-        self,
-        metadata: DeepseekV4ForwardMetadata,
-        *,
-        window_size: int,
-        block_size: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Metadata setup refreshes values on each step/replay. Layers only
-        # reuse that step's result; shape alone never validates a new step.
-        attention = metadata.attention
-        if (
-            attention.decode_swa_indices is not None
-            and attention.decode_swa_lens is not None
-            and attention.decode_swa_window_size == window_size
-            and attention.decode_swa_block_size == block_size
-            and attention.decode_swa_indices.shape[0]
-            == metadata.token_to_req_indices.numel()
-        ):
-            return attention.decode_swa_indices, attention.decode_swa_lens
-        return self._update_decode_swa_metadata(
-            metadata, window_size=window_size, block_size=block_size
-        )
 
     def _update_decode_swa_metadata(
         self,
@@ -1455,9 +1427,22 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             )
             q_padded[:, :actual_heads].copy_(q)
         swa_block_size = token_to_kv_pool.swa_block_size
-        swa_indices, swa_lens = self._get_decode_swa_metadata(
-            metadata, window_size=window_size, block_size=swa_block_size
-        )
+        attention_metadata = metadata.attention
+        if (
+            attention_metadata.decode_swa_indices is not None
+            and attention_metadata.decode_swa_lens is not None
+            and attention_metadata.decode_swa_window_size == window_size
+            and attention_metadata.decode_swa_block_size == swa_block_size
+            and attention_metadata.decode_swa_indices.shape[0] == positions.numel()
+        ):
+            swa_indices = attention_metadata.decode_swa_indices
+            swa_lens = attention_metadata.decode_swa_lens
+        else:
+            swa_indices, swa_lens = self._update_decode_swa_metadata(
+                metadata,
+                window_size=window_size,
+                block_size=swa_block_size,
+            )
         # SWA is replicated. Only one context shard counts it in compressed layers.
         local_swa_lens = swa_lens
         if use_dcp and self.dcp_rank != 0:
@@ -1493,7 +1478,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             extra_page_size=(
                 compressed_block_size if compressed_cache_2d is not None else None
             ),
-            **({"return_lse": True} if use_dcp else {}),
+            return_lse=True if use_dcp else None,
         )
         if use_dcp:
             partial, lse = result
@@ -2548,7 +2533,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             else {}
         )
         cache_metadata = DeepseekV4CacheMetadata(
-            **self._cache_metadata_kwargs(),
+            dcp_size=self.dcp_size,
+            dcp_rank=self.dcp_rank,
+            runtime_contract=self.cache_pool.arena.runtime_contract,
             page_size=self.kernel_page_size,
             page_table=self._cuda_graph_page_table[:bs, : self.max_num_pages],
             block_tables=metadata_block_tables,
@@ -2741,7 +2728,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         metadata.token_to_req_indices = self._cuda_graph_token_to_req[:total_tokens]
         metadata.is_valid_token = self._cuda_graph_is_valid_token[:total_tokens]
         metadata.cache = DeepseekV4CacheMetadata(
-            **self._cache_metadata_kwargs(),
+            dcp_size=self.dcp_size,
+            dcp_rank=self.dcp_rank,
+            runtime_contract=self.cache_pool.arena.runtime_contract,
             page_size=self.kernel_page_size,
             page_table=self._cuda_graph_page_table[:bs, : self.max_num_pages],
             block_tables=metadata_block_tables,
