@@ -3916,13 +3916,6 @@ def dsv4_decode(
     """Run DeepSeek V4 selected attention over page-planar FP8 caches.
 
     SWA and optional extra compressed rows form independent selected segments.
-    For each query/cache geometry, scan-length values must remain the same
-    within a forward. Schedules are shared even when length tensors are rebuilt,
-    independently of ``return_lse``. Call ``dsv4_reset_attention_state`` before
-    changing length values, including when replacing tensors. Graph capture
-    records schedule generation at first use, so replay refreshes device values.
-    Other backends may have no separate schedule.
-
     Invalid negative slots and entries beyond each segment's per-token length
     do not contribute to attention.
 
@@ -3950,14 +3943,12 @@ def dsv4_decode(
             returned output is this same tensor, including with return_lse=True.
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
-        return_lse: Return a no-sink partial and its natural-log LSE. Requires
-            attn_sink=None and an explicitly compatible kernel.
+        return_lse: Return a partial and its natural-log LSE. Notice that whether 
+            the returned lse includes attn sink depends on the backend.
     Returns:
         BF16 attention output shaped like ``q``. With return_lse=True, also
         return natural-log FP32 LSE shaped [tokens, heads, 1], with one query
-        per token. Sink scaling is never included in these partials. Empty
-        selection values are backend-defined; the DCP caller uses actual local
-        valid counts to normalize them to output=0 and LSE=-inf before merging.
+        per token.
     """
     if q.dim() != 3 or q.shape[0] < 1 or q.shape[-1] != 512:
         raise ValueError(
@@ -3976,8 +3967,6 @@ def dsv4_decode(
         raise TypeError("swa_slots must have dtype int32 or int64")
     if swa_lens.dtype not in (torch.int32, torch.int64):
         raise TypeError("swa_lens must have dtype int32 or int64")
-    if return_lse and attn_sink is not None:
-        raise ValueError("DCP partial attention requires attn_sink=None")
     if attn_sink is not None and attn_sink.numel() < q.shape[1]:
         raise ValueError("attn_sink must provide one value per query head")
     if any(

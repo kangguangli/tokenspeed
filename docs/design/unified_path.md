@@ -241,18 +241,6 @@ snapshot verifies it. Slot writes exist only in the three publishers; the
 `forward_deepseek_v4_*` read paths thread resolved metadata as parameters
 and never write a slot.
 
-**V4 DCP uses these same views and publishers.** The backend binds placement
-from its cache pool's runtime contract and refreshes compressed attention's
-local page tables in place after filling the scheduler's virtual tables.
-Draft step views borrow that same cache object; the indexer continues to read
-and write its replicated group. Virtual null blocks remain write-masked even
-when the fused slot mapper accepts physical page 0 for warmup. Query padding
-for gathered DCP heads has its
-own persistent workspace, sized at decode-state initialization. Nonowner SWA
-lengths stay zero so replicated SWA contributes on exactly one shard.
-Prefill request slices carry their placement and gather plan explicitly to
-the workspace builder, without changing the backend's published slots.
-
 ### PD decode nodes
 
 A PD decode-only node never runs an extend forward, so latches set on the
@@ -528,10 +516,6 @@ down to the router and V4).
   every address the capture recorded in place under the guard, the `cache`
   slot's group tables included, for the target's packed views and the
   draft's borrowed step views.
-* `test/runtime/test_deepseek_v4_dcp_unified.py` — DCP virtual-to-local table
-  refresh preserves target and draft graph addresses; compressed selection
-  counts owned rows, indexer writes stay replicated, and prefill slices use
-  the matching request gather plan.
 * `test/runtime/execution/test_draft_target_wiring.py` — the drafter's
   target-forward hook: DFLASH arms its capture sink on the context only
   under its overlap gate (not on mixed rounds, not in graph warmup), the

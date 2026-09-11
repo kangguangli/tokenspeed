@@ -163,9 +163,8 @@ class AttnConfig:
     """The model's attention configuration: model-wide facts + components.
 
     Exactly one component is the softmax family (validated below); extra
-    components (linear attention) ride alongside as peers. Family ``generate()``
-    methods construct the config; ``registry._create_attn_config`` composes
-    any extra components.
+    components (linear attention) ride alongside as peers. Built exclusively
+    by ``registry._create_attn_config`` — one construction seam.
     """
 
     device: str

@@ -386,8 +386,6 @@ if (
         out: torch.Tensor | None = None,
         return_lse: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if return_lse and attn_sink is not None:
-            raise ValueError("FlashMLA DCP partials must omit the sink")
         q_kernel = q.unsqueeze(1)
         swa_indices = swa_slots.reshape(q.shape[0], 1, -1)
         row_bytes = _dsv4_fp8_row_bytes(q.shape[-1])

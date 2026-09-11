@@ -1234,15 +1234,13 @@ def _dsv4_fused_sparse_compress_cache_kernel(
     x_fp8 = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX).to(tl.float8e4nv)
     x_uint8 = tl.reshape(x_fp8.to(tl.uint8, bitcast=True), (TRITON_BLOCK_SIZE,))
 
-    tl.store(fp8_ptr + block, x_uint8, mask=(block < NOPE_HEAD_DIM) & write_valid)
+    tl.store(fp8_ptr + block, x_uint8, mask=block < NOPE_HEAD_DIM)
     scale_idx = tl.arange(0, N_QUANT_BLOCKS)
     encoded = tl.maximum(tl.minimum(exponents + 127.0, 255.0), 0.0)
     tl.store(
-        scale_ptr + scale_idx,
-        encoded.to(tl.uint8),
-        mask=(scale_idx < N_NOPE_BLOCKS) & write_valid,
+        scale_ptr + scale_idx, encoded.to(tl.uint8), mask=scale_idx < N_NOPE_BLOCKS
     )
-    tl.store(scale_ptr + N_NOPE_BLOCKS, tl.zeros((), dtype=tl.uint8), mask=write_valid)
+    tl.store(scale_ptr + N_NOPE_BLOCKS, tl.zeros((), dtype=tl.uint8))
 
     NUM_PAIRS: tl.constexpr = TRITON_BLOCK_SIZE // 2
     NOPE_PAIRS: tl.constexpr = NOPE_HEAD_DIM // 2
@@ -2404,7 +2402,7 @@ def dsv4_compute_global_topk_indices_and_lens(
             pages are unreadable. DCP callers prepare local pages before this op.
             Physical slots must fit int32. Both tables allow strided rows, with
             unit column stride. All input tensors must share a device.
-        block_size: Compressed entries per physical page.
+        block_size: Positive number of compressed entries per physical page.
         is_valid_token: Optional boolean vector covering every query; false
             entries identify padded queries.
         block_table_base_offsets: Optional int32/int64 vector of absolute first
@@ -2419,6 +2417,9 @@ def dsv4_compute_global_topk_indices_and_lens(
         candidates with trailing padding this equals their valid count. Base
         and page filtering preserve this prefix even when every output is -1.
         Every slot is written, preserving candidate order, holes and duplicates.
+
+    Callers provide metadata with the documented shapes, dtypes and device.
+    Validation covers the top-k tensor, column strides and output count buffer.
     """
 
     if topk_indices.dtype != torch.int32:
@@ -2426,32 +2427,8 @@ def dsv4_compute_global_topk_indices_and_lens(
     if topk_indices.dim() != 2:
         raise ValueError(f"topk_indices must be 2-D, got {tuple(topk_indices.shape)}")
     num_tokens = topk_indices.shape[0]
-    if block_size <= 0 or block_table.ndim != 2:
-        raise ValueError("top-k mapping requires a page table and positive geometry")
-    if topk_indices.shape[1] > torch.iinfo(torch.int32).max:
-        raise ValueError("top-k width must fit int32 scan lengths")
-    if block_table.dtype not in (torch.int32, torch.int64):
-        raise TypeError("block_table must be int32 or int64")
-    if block_table.device != topk_indices.device:
-        raise ValueError("block_table must be on the query device")
     if topk_indices.stride(1) != 1 or block_table.stride(1) != 1:
         raise ValueError("top-k mapping requires contiguous rows")
-    for name, vector, length in (
-        ("token_to_req_indices", token_to_req_indices, num_tokens),
-        ("block_table_base_offsets", block_table_base_offsets, block_table.shape[0]),
-        ("is_valid_token", is_valid_token, num_tokens),
-    ):
-        if vector is None:
-            continue
-        if vector.ndim != 1 or vector.numel() < length:
-            raise ValueError(f"{name} must be a vector covering {length} entries")
-        dtypes = (
-            (torch.bool,) if name == "is_valid_token" else (torch.int32, torch.int64)
-        )
-        if vector.dtype not in dtypes:
-            raise TypeError(f"{name} has unsupported dtype {vector.dtype}")
-        if vector.device != topk_indices.device:
-            raise ValueError(f"{name} must be on the query device")
     if out_valid_lens is not None and (
         out_valid_lens.shape != (num_tokens,)
         or out_valid_lens.dtype != torch.int32
