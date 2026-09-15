@@ -49,6 +49,8 @@ CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t 
                 "group block_granularity must be a positive divisor of the prefix granularity");
         _assert(groups_[i].Allocator().CacheBlocksPerLcmBlock() == groups_[i].Spec().cache_blocks_per_lcm_block,
                 "group allocator packing must match its group spec");
+        _assert(groups_[i].Allocator().ShardCount() == groups_[i].Spec().shard_count,
+                "group allocator shard count must match its group spec");
         const auto& spec = groups_[i].Spec();
         pool_.RegisterGroup(groups_[i].Id(), spec.cache_blocks_per_lcm_block, spec.shard_count);
         if (host_pool_ != nullptr) {

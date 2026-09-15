@@ -45,8 +45,7 @@ namespace tokenspeed {
 // group's PrefixCacheIndex, match policy in its PrefixMatcher.
 class GroupAllocator {
 public:
-    explicit GroupAllocator(std::int32_t cache_blocks_per_lcm_block = 1, std::uint32_t group_id = 0,
-                            std::int32_t shard_count = 1)
+    GroupAllocator(std::int32_t cache_blocks_per_lcm_block, std::uint32_t group_id, std::int32_t shard_count)
         : cache_blocks_per_lcm_block_{cache_blocks_per_lcm_block}, group_id_{group_id}, shard_count_{shard_count} {
         _assert(cache_blocks_per_lcm_block > 0, "cache_blocks_per_lcm_block must be > 0");
         _assert(shard_count > 0 && cache_blocks_per_lcm_block % shard_count == 0,
@@ -58,6 +57,8 @@ public:
 
     std::int32_t CacheBlocksPerLcmBlock() const noexcept { return cache_blocks_per_lcm_block_; }
     std::uint32_t Id() const noexcept { return group_id_; }
+    // Cyclic owners of this group's virtual blocks; 1 balances nothing.
+    std::int32_t ShardCount() const noexcept { return shard_count_; }
 
     std::int32_t ResolveCacheBlockId(CacheBlockLocation location) const {
         _assert(location.lcm_block_id > 0, "LCM block id must be > 0");

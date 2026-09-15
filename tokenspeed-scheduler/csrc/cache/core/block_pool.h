@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <limits>
 #include <optional>
 #include <set>
 #include <span>
@@ -197,12 +198,14 @@ public:
                    "CacheBlock location has invalid slot");
         const std::size_t slot = static_cast<std::size_t>(location.slot_index);
         FatalCheck(parent.occupancy[slot] && parent.occupied_count > 0, "CacheBlock location is not occupied");
+        FatalCheck(parent.bound_group.has_value(), "occupied LCM parent has no bound group");
         GroupAvailability& group = placement(*parent.bound_group);
         removeAvailability(group, parent, location.lcm_block_id);
         parent.occupancy[slot] = false;
         --parent.occupied_count;
         ++group.free_slots;
         if (parent.occupied_count == 0) {
+            FatalCheck(group.free_slots >= parent.occupancy.size(), "group free-slot count underflow on unbind");
             group.free_slots -= parent.occupancy.size();
             parent.bound_group.reset();
             parent.occupancy.clear();
@@ -254,7 +257,9 @@ private:
         }
         for (std::size_t bucket = 0; bucket < group.parents_by_bucket.size(); ++bucket) {
             if (parent.first_free_slots[bucket] < group.packing) {
-                group.parents_by_bucket[bucket].erase({-static_cast<std::int32_t>(parent.occupied_count), id});
+                const auto erased =
+                    group.parents_by_bucket[bucket].erase({-static_cast<std::int32_t>(parent.occupied_count), id});
+                FatalCheck(erased == 1, "partial LCM parent missing from its bucket index");
             }
         }
     }
@@ -265,7 +270,9 @@ private:
         }
         for (std::size_t bucket = 0; bucket < group.parents_by_bucket.size(); ++bucket) {
             if (parent.first_free_slots[bucket] < group.packing) {
-                group.parents_by_bucket[bucket].emplace(-static_cast<std::int32_t>(parent.occupied_count), id);
+                const auto [_, inserted] =
+                    group.parents_by_bucket[bucket].emplace(-static_cast<std::int32_t>(parent.occupied_count), id);
+                FatalCheck(inserted, "partial LCM parent already present in its bucket index");
             }
         }
     }
@@ -378,6 +385,7 @@ private:
         FatalCheck(!parent.occupancy[slot], "LCM child slot already occupied");
         parent.occupancy[slot] = true;
         ++parent.occupied_count;
+        FatalCheck(group.free_slots > 0, "group free-slot count underflow on occupy");
         --group.free_slots;
         if (slots_per_parent > 1) {
             auto& first = parent.first_free_slots[slot % buckets];
