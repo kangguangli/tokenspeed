@@ -1251,6 +1251,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             seq_lens=torch.ones(1, dtype=torch.int32),
             forward_mode=ForwardMode.EXTEND,
             block_tables={"v4.swa_kv": swa_table, "v4.state": state_table},
+            block_tables_cpu={"v4.swa_kv": swa_table, "v4.state": state_table},
         )
 
         # Two steps per round (init + decode refresh); both receive the same
@@ -3454,6 +3455,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             seq_lens=torch.tensor([7, 10, 4], dtype=torch.int32),
             forward_mode=ForwardMode.MIXED,
             block_tables={},
+            block_tables_cpu={},
             **_extend_kwargs(
                 torch.tensor([7], dtype=torch.int32),
                 torch.zeros(1, dtype=torch.int32),
@@ -3504,6 +3506,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                     ),
                     forward_mode=ForwardMode.MIXED,
                     block_tables={},
+                    block_tables_cpu={},
                     **_extend_kwargs(
                         torch.tensor([prefill_tokens], dtype=torch.int32),
                         torch.zeros(1, dtype=torch.int32),
@@ -3565,6 +3568,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 seq_lens=torch.tensor([7, 20], dtype=torch.int32),
                 forward_mode=ForwardMode.MIXED,
                 block_tables={},
+                block_tables_cpu={},
                 **_extend_kwargs(
                     torch.tensor([7], dtype=torch.int32),
                     torch.zeros(1, dtype=torch.int32),
@@ -3596,6 +3600,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             seq_lens=torch.tensor([17, 65], dtype=torch.int32),
             forward_mode=ForwardMode.EXTEND,
             block_tables={},
+            block_tables_cpu={},
             **_extend_kwargs(
                 torch.tensor([5, 9], dtype=torch.int32),
                 torch.tensor([12, 56], dtype=torch.int32),
@@ -3642,6 +3647,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 seq_lens=torch.tensor([5], dtype=torch.int32),
                 forward_mode=ForwardMode.EXTEND,
                 block_tables={},
+                block_tables_cpu={},
                 **_extend_kwargs(short, torch.tensor([2], dtype=torch.int32)),
             )
 
@@ -3657,6 +3663,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 seq_lens=torch.tensor([131], dtype=torch.int32),
                 forward_mode=ForwardMode.EXTEND,
                 block_tables={},
+                block_tables_cpu={},
                 **_extend_kwargs(torch.tensor([3], dtype=torch.int32), short),
             )
 
@@ -3779,6 +3786,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             seq_lens=torch.tensor([4, 7, 9], dtype=torch.int32),
             forward_mode=ForwardMode.EXTEND,
             block_tables={},
+            block_tables_cpu={},
             **_extend_kwargs(
                 torch.tensor([2, 1, 3], dtype=torch.int32),
                 torch.tensor([2, 6, 6], dtype=torch.int32),
@@ -3872,6 +3880,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             seq_lens=seq_lens,
             forward_mode=ForwardMode.MIXED,
             block_tables={},
+            block_tables_cpu={},
             **_extend_kwargs(
                 torch.tensor([7], dtype=torch.int32),
                 torch.zeros(1, dtype=torch.int32),
@@ -4288,6 +4297,9 @@ class TestDeepseekV4Config(unittest.TestCase):
             block_tables={
                 V4_SWA_KV_GROUP_ID: torch.tensor([[10], [20], [30]], dtype=torch.int32)
             },
+            block_tables_cpu={
+                V4_SWA_KV_GROUP_ID: torch.tensor([[10], [20], [30]], dtype=torch.int32)
+            },
             **_extend_kwargs(
                 torch.tensor([3, 1, 1], dtype=torch.int32),
                 torch.tensor([2, 8, 11], dtype=torch.int32),
@@ -4381,6 +4393,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             seq_lens=torch.tensor([5, 9, 12, 6], dtype=torch.int32),
             forward_mode=ForwardMode.MIXED,
             block_tables={},
+            block_tables_cpu={},
             **_extend_kwargs(
                 torch.tensor([3, 4, 1, 1], dtype=torch.int32),
                 torch.tensor([2, 5, 11], dtype=torch.int32),
@@ -4430,6 +4443,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             seq_lens=torch.tensor([5, 9, 12], dtype=torch.int32),
             forward_mode=ForwardMode.MIXED,
             block_tables={},
+            block_tables_cpu={},
             **_extend_kwargs(
                 torch.tensor([3, 1, 1], dtype=torch.int32),
                 torch.tensor([2], dtype=torch.int32),
@@ -4538,6 +4552,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             seq_lens=torch.tensor([5, 9, 12], dtype=torch.int32),
             forward_mode=ForwardMode.MIXED,
             block_tables={},
+            block_tables_cpu={},
             **_extend_kwargs(
                 torch.tensor([3, 1, 1], dtype=torch.int32),
                 torch.tensor([2], dtype=torch.int32),
@@ -5905,6 +5920,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             seq_lens=seq_lens,
             forward_mode=ForwardMode.EXTEND,
             block_tables={},
+            block_tables_cpu={},
             **_extend_kwargs(seq_lens.cpu(), torch.zeros(1, dtype=torch.int32)),
         )
         backend.init_cuda_graph_state(max_bs=max(1, 4))

@@ -1314,6 +1314,7 @@ class ModelExecutor:
             self.nan_guard.reset(bs)
             cache_metadata = None
             block_tables = {}
+            block_tables_cpu = {}
             if bs > 0:
                 # Validate and pack the per-group tables once for this batch.
                 cache_metadata = CacheBatchMetadata.from_forward_op(
@@ -1323,6 +1324,9 @@ class ModelExecutor:
                     num_requests=bs,
                 )
                 block_tables = dict(cache_metadata.tables(active_forward_op=forward_op))
+                block_tables_cpu = dict(
+                    cache_metadata.tables_cpu(active_forward_op=forward_op)
+                )
             decode_input_ids = self.input_buffers.fill_input_buffers(
                 forward_op=forward_op,
                 runtime_states=self.runtime_states,
@@ -1487,6 +1491,7 @@ class ModelExecutor:
                             :num_extends
                         ],
                         block_tables=block_tables,
+                        block_tables_cpu=block_tables_cpu,
                     )
                     if timing_enabled:
                         forward_step_ms = (

@@ -28,7 +28,7 @@ from typing import Any
 import torch
 
 from tokenspeed.runtime.engine.scheduler_utils import (
-    block_tables_from_forward_op,
+    packed_block_tables_from_forward_op,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     CacheRuntimeContract,
@@ -46,6 +46,7 @@ class CacheBatchMetadata:
 
     group_ids: tuple[str, ...]
     _group_tables: Mapping[str, torch.Tensor] = field(repr=False, compare=False)
+    _group_tables_cpu: Mapping[str, torch.Tensor] = field(repr=False, compare=False)
     _forward_op: Any = field(repr=False, compare=False)
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -83,7 +84,7 @@ class CacheBatchMetadata:
             raise ValueError(
                 "runtime contract must provide ordered nonempty unique group IDs"
             )
-        tables = block_tables_from_forward_op(
+        tables = packed_block_tables_from_forward_op(
             forward_op,
             device,
             num_reqs=num_requests,
@@ -92,7 +93,8 @@ class CacheBatchMetadata:
         )
         return cls._from_validated_tables(
             group_ids=group_ids,
-            group_tables=tables,
+            group_tables=tables.tables,
+            group_tables_cpu=tables.tables_cpu,
             num_requests=num_requests,
             forward_op=forward_op,
         )
@@ -103,10 +105,11 @@ class CacheBatchMetadata:
         *,
         group_ids: tuple[str, ...],
         group_tables: Mapping[str, torch.Tensor],
+        group_tables_cpu: Mapping[str, torch.Tensor],
         num_requests: int,
         forward_op: Any,
     ) -> CacheBatchMetadata:
-        if tuple(group_tables) != group_ids:
+        if tuple(group_tables) != group_ids or tuple(group_tables_cpu) != group_ids:
             raise ValueError(
                 "cache group table mapping must exactly match contract order"
             )
@@ -134,9 +137,20 @@ class CacheBatchMetadata:
         if len(pointers) != 1:
             raise ValueError("cache group tables must share packed storage")
 
+        for group_id, table in group_tables_cpu.items():
+            if not isinstance(table, torch.Tensor) or table.device.type != "cpu":
+                raise ValueError(
+                    f"CPU table for cache group {group_id!r} must be on the CPU"
+                )
+            if tuple(table.shape) != tuple(ordered[group_id].shape):
+                raise ValueError(f"CPU and device tables for {group_id!r} disagree")
+
         metadata = object.__new__(cls)
         object.__setattr__(metadata, "group_ids", group_ids)
         object.__setattr__(metadata, "_group_tables", MappingProxyType(ordered))
+        object.__setattr__(
+            metadata, "_group_tables_cpu", MappingProxyType(dict(group_tables_cpu))
+        )
         # A strong reference makes Python/nanobind object identity safe against
         # id reuse until all metadata views become unreachable.
         object.__setattr__(metadata, "_forward_op", forward_op)
@@ -152,3 +166,8 @@ class CacheBatchMetadata:
         """Return all immutable table views after freshness validation."""
         self._validate_active_forward_op(active_forward_op)
         return self._group_tables
+
+    def tables_cpu(self, *, active_forward_op: Any) -> Mapping[str, torch.Tensor]:
+        """The same tables as CPU views of the stage they were uploaded from."""
+        self._validate_active_forward_op(active_forward_op)
+        return self._group_tables_cpu

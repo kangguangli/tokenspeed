@@ -40,7 +40,10 @@ def gather_query_heads(query: torch.Tensor, group: tuple[int, ...]) -> torch.Ten
         return query
     tokens, heads, dim = query.shape
     # The 2-D inner-dimension collective uses the existing low-latency
-    # backend where supported, with its topology/dtype/NCCL fallbacks.
+    # backend where supported, with its topology/dtype/NCCL fallbacks. Its
+    # symmetric buffer is sized for the prefill token budget although decode
+    # only ever gathers max_decode_bs * spec_tokens rows; a per-collective
+    # capacity needs the symmetric buffers managed in one place first.
     gathered = all_gather(
         query.reshape(tokens, heads * dim).contiguous(), group, dim=-1
     )

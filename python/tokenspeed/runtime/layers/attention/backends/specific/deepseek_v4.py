@@ -905,6 +905,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         forward_mode: ForwardMode,
         *,
         block_tables: Mapping[str, torch.Tensor],
+        block_tables_cpu: Mapping[str, torch.Tensor],
         extend_seq_lens: torch.Tensor,
         extend_seq_lens_cpu: torch.Tensor,
         extend_prefix_lens: torch.Tensor,
@@ -913,6 +914,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         num_tokens: int,
         **kwargs,
     ) -> None:
+        """Build extend/mixed metadata; ``block_tables_cpu`` mirrors
+        ``block_tables`` on the host so the DCP history exchange is planned
+        without waiting on the device."""
         if forward_mode.is_decode():
             raise RuntimeError(
                 "DeepSeek V4 decode metadata goes through "
@@ -1078,7 +1082,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             num_prefill_tokens=num_prefill_tokens,
             forward_mode=forward_mode,
         )
-        self._prepare_dcp_prefill_metadata(metadata)
+        self._prepare_dcp_prefill_metadata(metadata, block_tables_cpu)
         if forward_mode.is_idle():
             # A pure DECODE init raises at the top, so idle is the only
             # decode-shaped mode left here.
@@ -1526,17 +1530,28 @@ class DeepseekV4AttentionBackend(AttentionBackend):
     def _build_dcp_prefill_chunks(
         metadata: DeepseekV4ForwardMetadata,
         compress_ratio: int,
+        block_table_cpu: torch.Tensor,
         *,
         chunk_size: int,
         window_size: int,
     ) -> dict[tuple[int, int], DeepseekV4DcpPrefillChunk]:
-        """Plan dequantized row gathers for complete history and restore TP row order."""
+        """Plan the dequantized-row exchange that completes every request's history.
+
+        Each rank dequantizes the compressed rows it owns into the shared
+        prefill workspace; the plan lists, per owner, the workspace rows those
+        are, so one token all-gather followed by an index copy restores every
+        request's full history in TP row order. Built from the host copy of
+        the scheduler table with tensor operations only: no device sync and
+        no per-row Python.
+        """
         workspace_bounds = DeepseekV4AttentionBackend._prefill_workspace_bounds
         cache = metadata.cache
         degree, rank = cache.dcp_size, cache.dcp_rank
         count = metadata.num_prefill_reqs
         if degree <= 1 or chunk_size <= 0 or count <= 0:
             raise ValueError("DCP prefill planning requires a nonempty prefill batch")
+        if block_table_cpu.device.type != "cpu" or block_table_cpu.shape[0] < count:
+            raise ValueError("DCP prefill planning needs the host block table")
         seq_cpu = (
             metadata.seq_lens_cpu[:count] if metadata.seq_lens_cpu is not None else None
         )
@@ -1552,15 +1567,12 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             window_size=window_size,
             compress_ratio=compress_ratio,
         )
-        row_counts = [s // compress_ratio for s in seq_cpu.tolist()]
         gid = v4_compressed_kv_group_id(compress_ratio)
         rows_per_page = v4_compressed_rows_per_page(compress_ratio)
-        table = cache.compressed_block_table(compress_ratio)[:count].cpu().tolist()
         virtual_count = cache.runtime_contract.virtual_block_counts[gid]
+        table = block_table_cpu[:count].to(torch.int64)
+        row_counts = seq_cpu.to(torch.int64) // compress_ratio
         device = metadata.seq_lens.device
-
-        def tensor(values):
-            return torch.tensor(values, dtype=torch.int64, device=device)
 
         chunks = {}
         for start in range(0, count, chunk_size):
@@ -1573,34 +1585,46 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 compress_ratio=compress_ratio,
             )
             width = max(1, swa_width + compressed_width)
-            destinations = [[] for _ in range(degree)]
-            for req in range(start, end):
-                request_base = (req - start) * width
-                for entry_start in range(0, row_counts[req], rows_per_page):
-                    page_column = entry_start // rows_per_page
-                    virtual = (
-                        table[req][page_column]
-                        if 0 <= page_column < len(table[req])
-                        else 0
-                    )
-                    entries = range(
-                        entry_start, min(entry_start + rows_per_page, row_counts[req])
-                    )
-                    if not 0 < virtual < virtual_count:
-                        continue
-                    owner = (virtual - 1) % degree
-                    destinations[owner].extend(request_base + e for e in entries)
-            counts = [len(rows) for rows in destinations]
+            rows = row_counts[start:end]
+            max_rows = int(rows.max()) if end > start else 0
+            # [requests, rows]: the virtual page of every history row, 0 where
+            # the request has no such row or the table has no such column.
+            entry = torch.arange(max_rows, dtype=torch.int64)
+            column = entry // rows_per_page
+            chunk_table = table[start:end]
+            in_table = column < chunk_table.shape[1]
+            virtual = torch.zeros((end - start, max_rows), dtype=torch.int64)
+            virtual[:, in_table] = chunk_table[:, column[in_table]]
+            valid = (entry[None, :] < rows[:, None]) & (virtual > 0)
+            valid &= virtual < virtual_count
+            # Owners in [0, degree); ``degree`` marks rows nobody exchanges.
+            owner = torch.where(valid, (virtual - 1) % degree, torch.tensor(degree))
+            destination = (
+                torch.arange(end - start, dtype=torch.int64)[:, None] * width
+                + entry[None, :]
+            )
+            # Group by owner while keeping (request, row) order within each
+            # owner: a stable sort of the row-major flattening.
+            order = torch.argsort(owner.flatten(), stable=True)
+            sorted_owner = owner.flatten()[order]
+            destinations = destination.flatten()[order][sorted_owner < degree]
+            counts = torch.bincount(
+                sorted_owner[sorted_owner < degree], minlength=degree
+            )
+            offsets = torch.cumsum(counts, dim=0) - counts
+            local = destinations[offsets[rank] : offsets[rank] + counts[rank]]
             chunks[start, end] = DeepseekV4DcpPrefillChunk(
-                local_destinations=tensor(destinations[rank]),
-                counts=counts,
-                destinations=tensor([row for rows in destinations for row in rows]),
+                local_destinations=local.to(device),
+                counts=counts.tolist(),
+                destinations=destinations.to(device),
                 workspace_width=width,
             )
         return chunks
 
     def _prepare_dcp_prefill_metadata(
-        self, metadata: DeepseekV4ForwardMetadata
+        self,
+        metadata: DeepseekV4ForwardMetadata,
+        block_tables_cpu: Mapping[str, torch.Tensor],
     ) -> None:
         """Plan the cross-rank history exchange of every sharded compressed group.
 
@@ -1616,6 +1640,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             metadata.dcp_prefill[ratio] = self._build_dcp_prefill_chunks(
                 metadata,
                 ratio,
+                block_tables_cpu[group_id],
                 chunk_size=self.prefill_chunk_size,
                 window_size=self._swa_window_tokens(),
             )
