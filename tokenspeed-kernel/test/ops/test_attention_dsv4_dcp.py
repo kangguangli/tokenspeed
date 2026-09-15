@@ -49,7 +49,11 @@ requires_cuda = pytest.mark.skipif(
 
 HEAD_DIM = 512
 PAGE_ROWS = 64
-SWA_ROW_BYTES = 584  # 448 FP8 nope + 64 BF16 rope + FP8 scales (fp8_swa_page_planar).
+SWA_TOKEN_STRIDE = 576  # 448 FP8 nope + 64 BF16 rope per row (fp8_swa_page_planar).
+SWA_ROW_BYTES = SWA_TOKEN_STRIDE + 8  # plus one FP8 scale per 64-wide nope block.
+# The arena aligns every page's stride to the token stride; SM100 FlashMLA
+# requires that alignment for its TMA loads.
+SWA_PAGE_BYTES = -(-PAGE_ROWS * SWA_ROW_BYTES // SWA_TOKEN_STRIDE) * SWA_TOKEN_STRIDE
 
 
 def _reference_translation(slots, rows, virtual_count, degree, rank):
@@ -340,7 +344,7 @@ def test_decode_refuses_a_sink_together_with_lse():
     with pytest.raises(ValueError, match="no-sink LSE"):
         dsv4_decode(
             q=q,
-            swa_kv_cache=torch.empty(1, PAGE_ROWS * SWA_ROW_BYTES, dtype=torch.uint8),
+            swa_kv_cache=torch.empty(1, SWA_PAGE_BYTES, dtype=torch.uint8),
             swa_slots=torch.zeros(1, 8, dtype=torch.int32),
             swa_lens=torch.zeros(1, dtype=torch.int32),
             swa_page_size=PAGE_ROWS,
@@ -352,13 +356,13 @@ def test_decode_refuses_a_sink_together_with_lse():
 
 def _page_planar_cache(pages, page_size):
     """A random FP8 SWA-layout cache plus its BF16 row reference [pages*page_size, 512]."""
+    assert page_size == PAGE_ROWS
     nope = torch.randn(pages, page_size, 448, device="cuda").to(torch.float8_e4m3fn)
     rope = torch.randn(pages, page_size, 64, device="cuda", dtype=torch.bfloat16)
-    cache = torch.full(
-        (pages, page_size * SWA_ROW_BYTES), 127, device="cuda", dtype=torch.uint8
-    )
+    # 127 is the UE8M0 scale for 1.0, so every quant block dequantizes as-is.
+    cache = torch.full((pages, SWA_PAGE_BYTES), 127, device="cuda", dtype=torch.uint8)
     payload = torch.cat((nope.view(torch.uint8), rope.view(torch.uint8)), dim=-1)
-    cache[:, : page_size * 576] = payload.reshape(pages, -1)
+    cache[:, : page_size * SWA_TOKEN_STRIDE] = payload.reshape(pages, -1)
     reference = torch.cat((nope.to(torch.bfloat16), rope), dim=-1).reshape(-1, HEAD_DIM)
     return cache, reference
 
@@ -502,11 +506,7 @@ def test_masked_compress_stores_leave_every_other_byte_untouched(compress_ratio)
         tokens * 2, state_rows, HEAD_DIM * 2, device="cuda", dtype=torch.float32
     )
     kv_cache = torch.randint(
-        0,
-        255,
-        (tokens + 2, PAGE_ROWS * SWA_ROW_BYTES),
-        device="cuda",
-        dtype=torch.uint8,
+        0, 255, (tokens + 2, SWA_PAGE_BYTES), device="cuda", dtype=torch.uint8
     )
     before = kv_cache.clone()
     kv_slots = (torch.arange(tokens, device="cuda", dtype=torch.int64) + 1) * PAGE_ROWS
