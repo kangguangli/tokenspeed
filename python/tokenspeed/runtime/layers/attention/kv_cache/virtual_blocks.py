@@ -39,7 +39,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
 )
 
 
-def local_blocks(
+def local_pages(
     virtual_blocks: Sequence[int],
     *,
     shard_count: int,
@@ -78,13 +78,13 @@ def local_blocks(
     return local[owned].tolist()
 
 
-def local_blocks_by_group(
+def local_pages_by_group(
     virtual_blocks_by_group: Mapping[str, Sequence[int]],
     *,
     contract: CacheRuntimeContract,
     rank: int,
 ) -> dict[str, list[int]]:
-    """Translate every group's scheduler blocks through :func:`local_blocks`.
+    """Translate every group's scheduler blocks through :func:`local_pages`.
 
     Args:
         virtual_blocks_by_group: Scheduler block IDs keyed by cache group id.
@@ -98,7 +98,7 @@ def local_blocks_by_group(
     shard_counts = {spec.group_id: spec.shard_count for spec in contract.group_specs}
     counts = contract.virtual_block_counts
     return {
-        group_id: local_blocks(
+        group_id: local_pages(
             block_ids,
             shard_count=shard_counts[group_id],
             rank=rank,

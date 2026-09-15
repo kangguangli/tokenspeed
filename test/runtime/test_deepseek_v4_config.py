@@ -369,7 +369,7 @@ def _make_deepseek_v4_cache_metadata(*, page_size, page_table, block_tables):
         dcp_rank=0,
         runtime_contract=_replicated_placement(block_tables),
     )
-    cache.refresh_attention_page_tables()
+    cache.refresh_page_tables()
     return cache
 
 
@@ -4131,13 +4131,13 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
         )
         self.assertTrue(
-            torch.equal(metadata.cache.compressed_page_table(4), compressed_table)
+            torch.equal(metadata.cache.compressed_block_table(4), compressed_table)
         )
         with self.assertRaisesRegex(
             RuntimeError,
             "missing cache-group block table",
         ):
-            metadata.cache.compressed_page_table(128)
+            metadata.cache.compressed_block_table(128)
 
         slots = metadata.cache.compressed_slot_mapping(
             torch.tensor([3, 7, 127], dtype=torch.int64),
@@ -5402,7 +5402,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 self.assertIsNot(
                     fresh, captured_mapping, "a publish must clear the memo"
                 )
-                table = backend.forward_metadata.cache.compressed_page_table(4)
+                table = backend.forward_metadata.cache.compressed_block_table(4)
                 self.assertTrue(torch.equal(table[:2, :2], c4_table))
                 self.assertTrue(torch.equal(table[2:], torch.full_like(table[2:], -1)))
 
@@ -6151,7 +6151,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             captured["has_forward_metadata"] = "metadata" in kwargs
             captured["has_sparse_indexer_metadata"] = "indexer_metadata" in kwargs
             captured["has_indexer_cache"] = "indexer_cache" in kwargs
-            captured["has_indexer_page_table"] = "indexer_page_table" in kwargs
+            captured["has_indexer_page_table"] = "indexer_block_table" in kwargs
             captured["cache_block_size"] = kwargs["indexer_block_size"]
             captured["cache_compress_ratio"] = kwargs["compress_ratio"]
             indexer_metadata = kwargs["indexer_metadata"]

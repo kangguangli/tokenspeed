@@ -76,7 +76,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     validate_scheduler_config,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.virtual_blocks import (
-    local_blocks_by_group,
+    local_pages_by_group,
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 from tokenspeed.runtime.layers.paged_attention import (
@@ -1159,7 +1159,7 @@ class ModelExecutor:
         if isinstance(pages, Mapping):
             # Group-keyed requests carry scheduler (virtual) IDs; pools and the
             # arena only ever see this rank's local pages.
-            pages = local_blocks_by_group(
+            pages = local_pages_by_group(
                 pages,
                 contract=self._cache_runtime_contract,
                 rank=self._cache_dcp_rank,

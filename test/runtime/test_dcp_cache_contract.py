@@ -62,8 +62,8 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4 import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import pack
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroupSpec
 from tokenspeed.runtime.layers.attention.kv_cache.virtual_blocks import (
-    local_blocks,
-    local_blocks_by_group,
+    local_pages,
+    local_pages_by_group,
 )
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
@@ -186,7 +186,7 @@ class RuntimeContractTest(unittest.TestCase):
                 _full_history_spec("g", shard_count=value)
 
 
-class LocalBlocksTest(unittest.TestCase):
+class LocalPagesTest(unittest.TestCase):
     def test_owned_blocks_partition_every_non_null_virtual_block(self):
         for shard_count in (1, 2, 3, 4):
             with self.subTest(shard_count=shard_count):
@@ -194,7 +194,7 @@ class LocalBlocksTest(unittest.TestCase):
                 virtual = list(range(count))
                 seen = []
                 for rank in range(shard_count):
-                    owned = local_blocks(
+                    owned = local_pages(
                         virtual,
                         shard_count=shard_count,
                         rank=rank,
@@ -211,26 +211,26 @@ class LocalBlocksTest(unittest.TestCase):
 
     def test_null_block_and_duplicates(self):
         self.assertEqual(
-            local_blocks([0, 3, 3, 0, 1], shard_count=2, rank=0, virtual_block_count=9),
+            local_pages([0, 3, 3, 0, 1], shard_count=2, rank=0, virtual_block_count=9),
             [2, 2, 1],
         )
         self.assertEqual(
-            local_blocks([0, 0], shard_count=1, rank=0, virtual_block_count=9), []
+            local_pages([0, 0], shard_count=1, rank=0, virtual_block_count=9), []
         )
 
     def test_out_of_range_ids_and_ranks_are_rejected(self):
         with self.assertRaises(IndexError):
-            local_blocks([9], shard_count=2, rank=0, virtual_block_count=9)
+            local_pages([9], shard_count=2, rank=0, virtual_block_count=9)
         with self.assertRaises(IndexError):
-            local_blocks([-1], shard_count=2, rank=0, virtual_block_count=9)
+            local_pages([-1], shard_count=2, rank=0, virtual_block_count=9)
         with self.assertRaises(ValueError):
-            local_blocks([1], shard_count=2, rank=2, virtual_block_count=9)
+            local_pages([1], shard_count=2, rank=2, virtual_block_count=9)
         with self.assertRaises(ValueError):
-            local_blocks([1], shard_count=0, rank=0, virtual_block_count=9)
+            local_pages([1], shard_count=0, rank=0, virtual_block_count=9)
 
     def test_by_group_reads_shard_count_and_bounds_from_the_contract(self):
         contract = _contract(parents=2, packing=2, shard_count=2)
-        translated = local_blocks_by_group(
+        translated = local_pages_by_group(
             {"sharded": [0, 1, 2, 3, 4, 8], "replicated": [0, 1, 4]},
             contract=contract,
             rank=1,
@@ -238,7 +238,7 @@ class LocalBlocksTest(unittest.TestCase):
         # Sharded: rank 1 owns virtual 2, 4, 6, 8 -> local 1, 2, 3, 4.
         self.assertEqual(translated, {"sharded": [1, 2, 4], "replicated": [1, 4]})
         with self.assertRaises(IndexError):
-            local_blocks_by_group({"replicated": [5]}, contract=contract, rank=0)
+            local_pages_by_group({"replicated": [5]}, contract=contract, rank=0)
 
 
 def _metadata(*, dcp_size: int, dcp_rank: int, table: torch.Tensor):
@@ -271,8 +271,8 @@ class CacheMetadataTranslationTest(unittest.TestCase):
             for rank in range(dcp_size):
                 with self.subTest(dcp_size=dcp_size, rank=rank):
                     metadata = _metadata(dcp_size=dcp_size, dcp_rank=rank, table=table)
-                    metadata.refresh_attention_page_tables()
-                    read = metadata.compressed_attention_page_table(4)
+                    metadata.refresh_page_tables()
+                    read = metadata.compressed_page_table(4)
                     virtual = table.long()
                     owned = (virtual > 0) & ((virtual - 1) % dcp_size == rank)
                     expected = torch.where(
@@ -284,13 +284,13 @@ class CacheMetadataTranslationTest(unittest.TestCase):
                     # Only compressed groups get a read view; the indexer reads
                     # its replicated table directly.
                     self.assertEqual(
-                        set(metadata.compressed_attention_page_tables),
+                        set(metadata.compressed_page_tables),
                         {v4_compressed_kv_group_id(4)},
                     )
                     table[0, 0] = 2
-                    metadata.refresh_attention_page_tables()
+                    metadata.refresh_page_tables()
                     self.assertEqual(
-                        metadata.compressed_attention_page_table(4).data_ptr(),
+                        metadata.compressed_page_table(4).data_ptr(),
                         read.data_ptr(),
                         "graph-captured read tables must be refreshed, not replaced",
                     )
@@ -341,26 +341,26 @@ class CacheMetadataTranslationTest(unittest.TestCase):
     def test_indexer_table_is_its_own_replicated_group(self):
         table = torch.tensor([[1, 2, 3, 4]], dtype=torch.int32)
         metadata = _metadata(dcp_size=4, dcp_rank=3, table=table)
-        self.assertTrue(torch.equal(metadata.indexer_page_table(), table))
+        self.assertTrue(torch.equal(metadata.indexer_block_table(), table))
         with self.assertRaisesRegex(RuntimeError, "missing cache-group block table"):
-            _metadata(dcp_size=4, dcp_rank=3, table=table).compressed_page_table(128)
+            _metadata(dcp_size=4, dcp_rank=3, table=table).compressed_block_table(128)
 
     def test_request_slices_keep_placement_and_read_views(self):
         table = torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.int32)
         metadata = _metadata(dcp_size=2, dcp_rank=1, table=table)
-        metadata.refresh_attention_page_tables()
+        metadata.refresh_page_tables()
         sliced = metadata.slice_requests(1, 3)
         self.assertEqual((sliced.dcp_size, sliced.dcp_rank), (2, 1))
         self.assertIs(sliced.runtime_contract, metadata.runtime_contract)
         self.assertTrue(
             torch.equal(
-                sliced.compressed_attention_page_table(4),
-                metadata.compressed_attention_page_table(4)[1:3],
+                sliced.compressed_page_table(4),
+                metadata.compressed_page_table(4)[1:3],
             )
         )
         self.assertEqual(
-            sliced.compressed_attention_page_table(4).data_ptr(),
-            metadata.compressed_attention_page_table(4)[1:3].data_ptr(),
+            sliced.compressed_page_table(4).data_ptr(),
+            metadata.compressed_page_table(4)[1:3].data_ptr(),
         )
 
 

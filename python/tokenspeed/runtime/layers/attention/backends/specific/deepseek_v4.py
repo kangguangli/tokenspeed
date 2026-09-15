@@ -139,7 +139,7 @@ def _refresh_decode_indexer_plan_cache(
             continue
         positions = _decode_positions_from_metadata(metadata, num_tokens)
         token_to_req_indices = metadata.token_to_req_indices[:num_tokens]
-        page_table = metadata.cache.indexer_page_table()
+        page_table = metadata.cache.indexer_block_table()
         rows = int(page_table.shape[0]) if page_table.ndim >= 1 else 0
         cols = int(page_table.shape[1]) if page_table.ndim >= 2 else 0
         if rows <= 0 or cols <= 0:
@@ -540,7 +540,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             dcp_rank=self.dcp_rank,
             runtime_contract=self.cache_pool.arena.runtime_contract,
         )
-        cache.refresh_attention_page_tables()
+        cache.refresh_page_tables()
         return cache
 
     def _prepare_cache_group_tables(
@@ -1162,7 +1162,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         if compress_ratio <= 1:
             return None, None, None
         num_tokens = positions.numel()
-        page_table = metadata.cache.compressed_attention_page_table(compress_ratio)
+        page_table = metadata.cache.compressed_page_table(compress_ratio)
         is_valid_token = (
             metadata.is_valid_token[:num_tokens]
             if metadata.is_valid_token is not None
@@ -1555,7 +1555,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         row_counts = [s // compress_ratio for s in seq_cpu.tolist()]
         gid = v4_compressed_kv_group_id(compress_ratio)
         rows_per_page = v4_compressed_rows_per_page(compress_ratio)
-        table = cache.compressed_page_table(compress_ratio)[:count].cpu().tolist()
+        table = cache.compressed_block_table(compress_ratio)[:count].cpu().tolist()
         virtual_count = cache.runtime_contract.virtual_block_counts[gid]
         device = metadata.seq_lens.device
 
@@ -1652,7 +1652,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 )
         # The read table maps virtual pages to local physical pages; pages of
         # other owners and the null block are -1 and dequantize to zero.
-        block_table = metadata.cache.compressed_attention_page_table(compress_ratio)[
+        block_table = metadata.cache.compressed_page_table(compress_ratio)[
             : seq_lens.numel()
         ]
         dsv4_dequantize_and_gather_k_cache(
@@ -1717,9 +1717,11 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         if compress_ratio == 4 and topk_indices is not None:
             compressed_block_size = token_to_kv_pool.get_compressed_block_size(layer_id)
             compressed_cache = token_to_kv_pool.get_compressed_kv_buffer_2d(layer_id)
-            compressed_page_table = cache_metadata.compressed_page_table(compress_ratio)
+            compressed_block_table = cache_metadata.compressed_block_table(
+                compress_ratio
+            )
             compressed_table_capacity = (
-                compressed_page_table.shape[1] * compressed_block_size
+                compressed_block_table.shape[1] * compressed_block_size
             )
             self._gather_compressed_prefill(
                 metadata=metadata,
@@ -1769,9 +1771,11 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         if compress_ratio > 1:
             assert compressed_cache is not None
             compressed_block_size = token_to_kv_pool.get_compressed_block_size(layer_id)
-            compressed_page_table = cache_metadata.compressed_page_table(compress_ratio)
+            compressed_block_table = cache_metadata.compressed_block_table(
+                compress_ratio
+            )
             compressed_table_capacity = (
-                compressed_page_table.shape[1] * compressed_block_size
+                compressed_block_table.shape[1] * compressed_block_size
             )
             self._gather_compressed_prefill(
                 metadata=metadata,
@@ -2214,7 +2218,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             max_num_pages=self.max_num_pages,
             forward_mode=forward_mode,
         )
-        metadata.cache.refresh_attention_page_tables()
+        metadata.cache.refresh_page_tables()
         if is_packed_decode and self.is_draft:
             self._prepare_draft_round(
                 metadata,
@@ -2323,7 +2327,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         is_decode = forward_mode.is_decode()
         metadata.num_prefill_reqs = 0
         metadata.num_prefill_tokens = 0
-        metadata.cache.refresh_attention_page_tables()
+        metadata.cache.refresh_page_tables()
         if is_packed_decode and self.is_draft:
             self._prepare_draft_round(
                 metadata,

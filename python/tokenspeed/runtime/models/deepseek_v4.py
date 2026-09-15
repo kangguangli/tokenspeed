@@ -1265,7 +1265,7 @@ def _deepseek_v4_sparse_attn_indexer(
     *,
     indexer_metadata: DeepseekV4SparseIndexerMetadata,
     indexer_cache: torch.Tensor,
-    indexer_page_table: torch.Tensor,
+    indexer_block_table: torch.Tensor,
     indexer_block_size: int,
     compress_ratio: int,
     packed_q_values: torch.Tensor,
@@ -1304,14 +1304,14 @@ def _deepseek_v4_sparse_attn_indexer(
     if decode_block_table is None:
         decode_block_table = torch.empty(
             (0, 1),
-            dtype=indexer_page_table.dtype,
-            device=indexer_page_table.device,
+            dtype=indexer_block_table.dtype,
+            device=indexer_block_table.device,
         )
     return torch.ops.tokenspeed.deepseek_v4_sparse_attn_indexer(
         indexer_cache,
         positions,
         batch_metadata.token_to_req_indices,
-        indexer_page_table,
+        indexer_block_table,
         batch_metadata.seq_lens_cpu,
         batch_metadata.query_lens_cpu,
         prefill_metadata.chunk_specs,
@@ -2493,11 +2493,11 @@ class DeepseekV4Indexer(nn.Module):
             if getattr(metadata, "is_valid_token", None) is not None
             else None
         )
-        indexer_page_table = metadata.cache.indexer_page_table()
+        indexer_block_table = metadata.cache.indexer_block_table()
         decode_plan = _deepseek_v4_indexer_decode_plan(
             positions=decode_positions,
             token_to_req_indices=metadata.token_to_req_indices[decode_start:decode_end],
-            block_table=indexer_page_table,
+            block_table=indexer_block_table,
             cache_block_size=indexer_block_size,
             compress_ratio=self.compress_ratio,
             metadata=metadata,
@@ -2649,10 +2649,10 @@ class DeepseekV4Indexer(nn.Module):
             if metadata.query_lens_cpu is not None and num_prefill_tokens > 0
             else empty_cpu
         )
-        indexer_page_table = metadata.cache.indexer_page_table()
+        indexer_block_table = metadata.cache.indexer_block_table()
         prefill_metadata = _deepseek_v4_indexer_prefill_metadata(
             metadata=metadata,
-            block_table=indexer_page_table,
+            block_table=indexer_block_table,
             cache_block_size=indexer_block_size,
             compress_ratio=self.compress_ratio,
             num_prefill_tokens=num_prefill_tokens,
@@ -2674,7 +2674,7 @@ class DeepseekV4Indexer(nn.Module):
                 token_to_req_indices=metadata.token_to_req_indices[
                     decode_start:decode_end
                 ],
-                block_table=indexer_page_table,
+                block_table=indexer_block_table,
                 cache_block_size=indexer_block_size,
                 compress_ratio=self.compress_ratio,
                 metadata=metadata,
@@ -2732,7 +2732,7 @@ class DeepseekV4Indexer(nn.Module):
         return _deepseek_v4_sparse_attn_indexer(
             indexer_metadata=indexer_metadata,
             indexer_cache=indexer_cache,
-            indexer_page_table=indexer_page_table,
+            indexer_block_table=indexer_block_table,
             indexer_block_size=indexer_block_size,
             compress_ratio=self.compress_ratio,
             packed_q_values=packed_index_q[0],

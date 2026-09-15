@@ -74,7 +74,7 @@ class DeepseekV4CacheMetadata:
 
     ``block_tables`` hold the scheduler's virtual block IDs. Writers translate
     through :meth:`local_compressed_write_slots`; attention reads the tables
-    :meth:`refresh_attention_page_tables` derives from them, in which the null
+    :meth:`refresh_page_tables` derives from them, in which the null
     block and every page another DCP rank owns are ``-1``. A replicated group
     (``shard_count == 1``) translates to itself, so the same path serves every
     DCP size.
@@ -95,9 +95,7 @@ class DeepseekV4CacheMetadata:
     )
     # Local read tables per compressed group; refreshed in place so CUDA
     # graphs keep their captured pointers.
-    compressed_attention_page_tables: dict[str, torch.Tensor] = field(
-        default_factory=dict
-    )
+    compressed_page_tables: dict[str, torch.Tensor] = field(default_factory=dict)
 
     @classmethod
     def from_group_tables(
@@ -157,13 +155,13 @@ class DeepseekV4CacheMetadata:
             dcp_rank=self.dcp_rank,
             runtime_contract=self.runtime_contract,
         )
-        sliced.compressed_attention_page_tables = {
+        sliced.compressed_page_tables = {
             group_id: table[start:end]
-            for group_id, table in self.compressed_attention_page_tables.items()
+            for group_id, table in self.compressed_page_tables.items()
         }
         return sliced
 
-    def refresh_attention_page_tables(self) -> None:
+    def refresh_page_tables(self) -> None:
         """Translate every compressed group's table to local pages, in place.
 
         Pages this rank does not own and the virtual null block become ``-1``.
@@ -173,7 +171,7 @@ class DeepseekV4CacheMetadata:
         for group_id, table in self.block_tables.items():
             if parse_v4_compressed_kv_group_id(group_id) is None:
                 continue
-            out = self.compressed_attention_page_tables.get(group_id)
+            out = self.compressed_page_tables.get(group_id)
             if out is not None and (
                 out.shape != table.shape
                 or out.dtype != table.dtype
@@ -195,21 +193,19 @@ class DeepseekV4CacheMetadata:
                 out=out,
             )
             local.masked_fill_(~owned, -1)
-            self.compressed_attention_page_tables[group_id] = local
-
-    def compressed_attention_page_table(self, compress_ratio: int) -> torch.Tensor:
-        """The local read table :meth:`refresh_attention_page_tables` prepared."""
-        return self.compressed_attention_page_tables[
-            v4_compressed_kv_group_id(compress_ratio)
-        ]
+            self.compressed_page_tables[group_id] = local
 
     def compressed_page_table(self, compress_ratio: int) -> torch.Tensor:
+        """The local read table :meth:`refresh_page_tables` prepared."""
+        return self.compressed_page_tables[v4_compressed_kv_group_id(compress_ratio)]
+
+    def compressed_block_table(self, compress_ratio: int) -> torch.Tensor:
         """The scheduler's virtual table for one compressed KV group."""
         if compress_ratio <= 1:
             return self.page_table
         return self._group_table(v4_compressed_kv_group_id(compress_ratio))
 
-    def indexer_page_table(self) -> torch.Tensor:
+    def indexer_block_table(self) -> torch.Tensor:
         """The scheduler's table for the replicated indexer K group."""
         return self._group_table(V4_INDEXER_KV_GROUP_ID)
 
@@ -224,8 +220,8 @@ class DeepseekV4CacheMetadata:
     def _slot_table(self, compress_ratio: int, *, indexer: bool) -> torch.Tensor:
         """The virtual table slot mappings for ``compress_ratio`` derive from."""
         if indexer:
-            return self.indexer_page_table()
-        return self.compressed_page_table(compress_ratio)
+            return self.indexer_block_table()
+        return self.compressed_block_table(compress_ratio)
 
     def local_compressed_write_slots(
         self, slots: torch.Tensor, compress_ratio: int
