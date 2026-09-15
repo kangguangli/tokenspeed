@@ -31,11 +31,11 @@ def _normalize_dcp_partials_kernel(
     swa_lens,
     extra_lens,
     normalized_lse,
-    OS_T: tl.constexpr,
-    OS_H: tl.constexpr,
-    OS_D: tl.constexpr,
-    LS_T: tl.constexpr,
-    LS_H: tl.constexpr,
+    os_t,
+    os_h,
+    os_d,
+    ls_t,
+    ls_h,
     HEADS: tl.constexpr,
     DIM: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -45,13 +45,17 @@ def _normalize_dcp_partials_kernel(
     nonempty = tl.load(swa_lens + token) > 0
     if extra_lens is not None:
         nonempty = nonempty | (tl.load(extra_lens + token) > 0)
-    value = tl.load(lse + token * LS_T + head * LS_H)
+    value = tl.load(lse + token * ls_t + head * ls_h)
+    # A kernel may report an empty row as +inf rather than -inf (FlashMLA
+    # does); a non-finite LSE therefore marks an empty selection too, so the
+    # weighting never sees exp(inf - inf).
+    nonempty = nonempty & (value == value) & (value != float("inf"))
     tl.store(
         normalized_lse + token * HEADS + head, tl.where(nonempty, value, -float("inf"))
     )
     if not nonempty:
         offsets = tl.arange(0, BLOCK).to(tl.int64)
-        tl.store(output + token * OS_T + head * OS_H + offsets * OS_D, 0, offsets < DIM)
+        tl.store(output + token * os_t + head * os_h + offsets * os_d, 0, offsets < DIM)
 
 
 def normalize_dcp_partials(
@@ -74,7 +78,9 @@ def normalize_dcp_partials(
 
     Returns:
         The input output tensor, and contiguous FP32 LSE. Empty rows become
-        output=0 and LSE=-inf; nonempty rows retain their original bits.
+        output=0 and LSE=-inf; nonempty rows retain their original bits. A row
+        is empty when both lengths are zero or when its LSE is NaN or +inf,
+        which is how a kernel reports attending to no key at all.
     """
     if output.ndim != 3 or lse.ndim != 2 or lse.shape != output.shape[:2]:
         raise ValueError("DCP normalization shapes disagree")
@@ -128,7 +134,7 @@ def _dcp_weight_kernel(
     ls_r,
     ls_t,
     ls_h,
-    TOKENS: tl.constexpr,
+    tokens,
     HEADS: tl.constexpr,
     DIM: tl.constexpr,
     DEGREE: tl.constexpr,
@@ -144,6 +150,9 @@ def _dcp_weight_kernel(
         shards < DEGREE,
         other=-float("inf"),
     )
+    # +inf is a kernel's "attended to nothing", never a finite softmax; treat
+    # it as the empty shard it is instead of producing exp(inf - inf).
+    lse = tl.where(lse == float("inf"), -float("inf"), lse)
     maximum = tl.max(lse, 0)
     has_nan = tl.sum((lse != lse).to(tl.int32), 0) > 0
     safe_max = tl.where(maximum == -float("inf"), 0.0, maximum)
@@ -151,6 +160,7 @@ def _dcp_weight_kernel(
     denominator = tl.sum(mass, 0)
     rank = tl.full((), RANK, tl.int64)
     local_lse = tl.load(all_lse + rank * ls_r + token * ls_t + head * ls_h)
+    local_lse = tl.where(local_lse == float("inf"), -float("inf"), local_lse)
     weight = tl.exp(local_lse - safe_max) / tl.maximum(
         denominator, 1.1754943508222875e-38
     )
@@ -161,7 +171,7 @@ def _dcp_weight_kernel(
     ).to(tl.float32)
     values = tl.where(local_lse == -float("inf"), 0.0, values)
     tl.store(
-        weighted + (head * TOKENS + token) * DIM + offsets,
+        weighted + (head * tokens.to(tl.int64) + token) * DIM + offsets,
         values * weight,
         offsets < DIM,
     )
@@ -246,7 +256,7 @@ def dcp_weight_for_reduce_scatter(
         lse,
         *output.stride(),
         *all_lse.stride(),
-        TOKENS=tokens,
+        tokens,
         HEADS=heads,
         DIM=dim,
         DEGREE=degree,

@@ -754,6 +754,7 @@ class DeepseekV4AttentionOpsCpuValidationTest(unittest.TestCase):
                 kv_slot_mapping=kv_slots,
                 kv_cache_block_size=64,
                 compress_ratio=128,
+                kv_write_mask=None,
             )
 
     def test_csa_indexer_cache_insert_requires_cuda(self):
@@ -1064,6 +1065,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             kv_slot_mapping=kv_slots,
             kv_cache_block_size=kv_cache_block_size,
             compress_ratio=compress_ratio,
+            kv_write_mask=None,
         )
 
         weights = torch.softmax(score.float() + ape, dim=0)
@@ -1175,6 +1177,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             kv_slot_mapping=kv_slots,
             kv_cache_block_size=kv_cache_block_size,
             compress_ratio=compress_ratio,
+            kv_write_mask=None,
         )
 
         flat_cache = cache.view(-1)

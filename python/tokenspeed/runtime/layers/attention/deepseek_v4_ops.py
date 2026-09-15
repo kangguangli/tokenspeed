@@ -528,8 +528,8 @@ def deepseek_v4_hca_compress_kv_cache_insert(
     kv_cache_2d: torch.Tensor,
     kv_slot_mapping: torch.Tensor,
     kv_cache_block_size: int,
+    kv_write_mask: torch.Tensor | None,
     compress_ratio: int = 128,
-    kv_write_mask: torch.Tensor | None = None,
 ) -> None:
     """Compress HCA state, normalize/RoPE/FP8-quantize, and insert KV cache.
 
@@ -591,6 +591,7 @@ def deepseek_v4_hca_compress_kv_cache_insert(
         kv_cache_block_size=kv_cache_block_size,
         compress_ratio=compress_ratio,
         overlap=False,
+        block_table_base_offsets=None,
         kv_write_mask=kv_write_mask,
     )
 
@@ -608,8 +609,8 @@ def deepseek_v4_csa_compress_kv_cache_insert(
     kv_cache_2d: torch.Tensor,
     kv_slot_mapping: torch.Tensor,
     kv_cache_block_size: int,
+    kv_write_mask: torch.Tensor | None,
     compress_ratio: int = 4,
-    kv_write_mask: torch.Tensor | None = None,
 ) -> None:
     """Compress CSA state and insert one `fp8_ds_mla` row per 4 tokens.
 
@@ -669,6 +670,7 @@ def deepseek_v4_csa_compress_kv_cache_insert(
         kv_cache_block_size=kv_cache_block_size,
         compress_ratio=compress_ratio,
         overlap=True,
+        block_table_base_offsets=None,
         kv_write_mask=kv_write_mask,
     )
 

@@ -1445,12 +1445,14 @@ def dsv4_fused_sparse_compress_cache_insert(
     kv_cache_block_size: int,
     compress_ratio: int,
     overlap: bool,
-    block_table_base_offsets: torch.Tensor | None = None,
-    kv_write_mask: torch.Tensor | None = None,
+    block_table_base_offsets: torch.Tensor | None,
+    kv_write_mask: torch.Tensor | None,
 ) -> None:
     """Compress replicated state and store owned FP8 payload, scale and RoPE.
 
     Args:
+        block_table_base_offsets: Optional per-request base offsets added to
+            the compressor block-table row before it is indexed.
         kv_write_mask: Optional contiguous boolean vector covering the input
             slots on the KV slot device. False entries suppress every store,
             including scale padding, and may safely address reserved page 0.
