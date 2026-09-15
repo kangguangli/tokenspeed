@@ -38,6 +38,8 @@ from dataclasses import dataclass
 from typing import TypeVar
 
 import torch
+from tokenspeed_kernel.ops.attention.dsv4 import dsv4_decode_supports_partials
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
@@ -210,8 +212,19 @@ class AttnConfig:
                 "AttnConfig requires exactly one softmax-family component, got "
                 f"{[type(c).__name__ for c in self.components] or 'none'}"
             )
-        if self.dcp_size > 1 and softmax_components[0].backend_name != "deepseek_v4":
-            raise ValueError("DCP currently requires the DeepSeek V4 attention backend")
+        if self.dcp_size > 1:
+            if softmax_components[0].backend_name != "deepseek_v4":
+                raise ValueError(
+                    "DCP currently requires the DeepSeek V4 attention backend"
+                )
+            # Partials merge through a no-sink LSE; fail here rather than at the
+            # first decode's kernel selection on platforms without that kernel.
+            platform = current_platform()
+            if not dsv4_decode_supports_partials(platform):
+                raise ValueError(
+                    "DCP requires a DeepSeek V4 decode kernel that returns a "
+                    f"no-sink LSE; none is registered for {platform.device_name}"
+                )
 
     def component(self, cls: type[ComponentT]) -> ComponentT | None:
         """The first component that is a ``cls``, or None.
@@ -259,12 +272,11 @@ def model_wide_kwargs(
         draft_block_decode=draft_block_decode,
     )
     attn_mapping = server_args.mapping.attn
-    if attn_mapping.has_dcp:
-        kwargs.update(
-            dcp_size=attn_mapping.dcp_size,
-            dcp_rank=attn_mapping.dcp_rank,
-            dcp_group=attn_mapping.dcp_group,
-        )
+    kwargs.update(
+        dcp_size=attn_mapping.dcp_size,
+        dcp_rank=attn_mapping.dcp_rank,
+        dcp_group=attn_mapping.dcp_group,
+    )
     if server_args.speculative_algorithm is not None:
         kwargs.update(
             speculative_num_steps=server_args.speculative_num_steps,

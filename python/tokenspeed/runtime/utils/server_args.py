@@ -672,11 +672,8 @@ class ServerArgs:
         )
 
         # Impl constraints:
-        if self.decode_context_parallel_size > 1:
-            if self.disaggregation_mode != "null" or self.enable_kvstore:
-                raise ValueError(
-                    "DCP cache transfer does not yet support PD or KVStore"
-                )
+        if self.mapping.attn.has_dcp and self.disaggregation_mode != "null":
+            raise ValueError("DCP cache transfer does not yet support PD")
         if self.mapping.moe.has_tp and self.mapping.moe.has_ep:
             raise ValueError("MoE TP and EP cannot be both > 1")
 
@@ -861,6 +858,13 @@ class ServerArgs:
             self.enable_kvstore = True
 
     def validate_cache_options(self):
+        # Runs after _handle_kvstore() has applied the KVStore default, so the
+        # check sees the effective setting rather than the pre-resolution flag.
+        if self.decode_context_parallel_size > 1 and self.enable_kvstore:
+            raise ValueError(
+                "DCP cache transfer does not yet support KVStore; "
+                "use --disable-kvstore."
+            )
         speculative_algorithm = getattr(self, "speculative_algorithm", None)
         draft_model_path_use_base = getattr(self, "draft_model_path_use_base", False)
         speculative_draft_model_path = getattr(

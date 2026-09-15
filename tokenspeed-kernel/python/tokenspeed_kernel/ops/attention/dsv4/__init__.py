@@ -23,10 +23,14 @@ from __future__ import annotations
 import math
 
 import torch
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import PlatformInfo, current_platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
-from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
+from tokenspeed_kernel.selection import (
+    NoKernelFoundError,
+    select_kernel,
+    spec_matches_traits,
+)
 from tokenspeed_kernel.signature import (
     MXFP8_BLOCK_SCALE,
     dense_tensor_format,
@@ -503,6 +507,30 @@ def dsv4_prefill(
         )
 
 
+_DSV4_PARTIAL_DECODE_TRAITS = {"support_sink": False, "return_lse": True}
+
+
+def dsv4_decode_supports_partials(platform: PlatformInfo) -> bool:
+    """Whether ``platform`` has a decode kernel that can emit a no-sink LSE.
+
+    Decode context parallelism attends to each rank's cache shard separately
+    and merges the partials through their LSE, so it needs a ``dsv4_decode``
+    kernel registered with ``support_sink`` including False and ``return_lse``
+    including True.
+
+    Args:
+        platform: Hardware the kernel must be registered for.
+
+    Returns:
+        True when at least one registered ``dsv4_decode`` kernel satisfies the
+        platform and both traits.
+    """
+    specs = KernelRegistry.get().get_for_operator(
+        "attention", "dsv4_decode", platform=platform
+    )
+    return any(spec_matches_traits(spec, _DSV4_PARTIAL_DECODE_TRAITS) for spec in specs)
+
+
 def dsv4_decode(
     q: torch.Tensor,
     swa_kv_cache: torch.Tensor,
@@ -550,13 +578,16 @@ def dsv4_decode(
             returned output is this same tensor, including with return_lse=True.
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
-        return_lse: Return a partial and its natural-log LSE. Notice that whether
-            the returned lse includes attn sink depends on the backend.
+        return_lse: Return a partial and its natural-log LSE. The LSE never
+            includes a sink, so ``attn_sink`` must be None; callers combining
+            partials apply the sink once after merging them.
     Returns:
         BF16 attention output shaped like ``q``. With return_lse=True, also
         return natural-log FP32 LSE shaped [tokens, heads, 1], with one query
         per token.
     """
+    if return_lse and attn_sink is not None:
+        raise ValueError("dsv4_decode returns a no-sink LSE; pass attn_sink=None")
     if q.dim() != 3 or q.shape[0] < 1 or q.shape[-1] != 512:
         raise ValueError(
             f"q must have shape [tokens, heads, 512], got {tuple(q.shape)}"
@@ -1086,6 +1117,7 @@ __all__ = [
     "dsv4_csa_indexer_fp8_cache_insert",
     "dsv4_prefill",
     "dsv4_decode",
+    "dsv4_decode_supports_partials",
     "dsv4_prefill_topk",
     "dsv4_decode_topk",
     "dsv4_plan",
