@@ -23,7 +23,7 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.ops.attention.triton.dcp import (
+from tokenspeed_kernel.ops.attention.dsv4._triton.dcp import (
     dcp_apply_sink,
     dcp_weight_for_reduce_scatter,
 )

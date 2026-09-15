@@ -36,13 +36,9 @@ import torch
 import torch.nn.functional as F
 from tokenspeed_kernel import (
     NoKernelFoundError,
-    dsa_decode_topk,
-    dsa_prefill_topk,
-    dsv4_decode_topk,
     dsv4_grouped_output_projection,
     dsv4_grouped_output_projection_plan,
     dsv4_grouped_output_projection_warmup_model,
-    dsv4_indexer_cache_format,
 )
 from tokenspeed_kernel import dsv4_linear_fp32 as _kernel_dsv4_linear_fp32
 from tokenspeed_kernel import (
@@ -50,21 +46,24 @@ from tokenspeed_kernel import (
     dsv4_mega_moe_plan,
     dsv4_mega_moe_process_weights,
     dsv4_mega_moe_warmup,
-    dsv4_padded_heads,
-    dsv4_plan,
-    dsv4_prefill_topk,
 )
 from tokenspeed_kernel import dsv4_select_experts as _kernel_dsv4_select_experts
-from tokenspeed_kernel import (
-    dsv4_warmup,
-)
 from tokenspeed_kernel import mhc_fused_hc as fast_mhc_fused_hc
 from tokenspeed_kernel import mhc_post as fast_mhc_post
 from tokenspeed_kernel import mhc_pre as fast_mhc_pre
 from tokenspeed_kernel import (
     pack_topk_router_logits,
 )
-from tokenspeed_kernel.ops.attention.triton.dsv4 import (
+from tokenspeed_kernel.ops.attention.dsa import dsa_decode_topk, dsa_prefill_topk
+from tokenspeed_kernel.ops.attention.dsv4 import (
+    dsv4_decode_topk,
+    dsv4_indexer_cache_format,
+    dsv4_padded_heads,
+    dsv4_plan,
+    dsv4_prefill_topk,
+    dsv4_warmup,
+)
+from tokenspeed_kernel.ops.attention.dsv4.triton import (
     dsv4_group_slot_mapping,
     dsv4_indexer_decode_metadata_compute,
 )
@@ -1995,10 +1994,8 @@ class DeepseekV4MoE(nn.Module):
                 activation="swiglu",
                 swiglu_limit=getattr(config, "swiglu_limit", None),
                 with_bias=False,
-                # FlashInfer's standard MXFP4 kernel performs routing in-kernel.
-                # Keep precomputed top-k for backends that require it; for
-                # FlashInfer, MoELayer repacks the already-selected routes into
-                # router logits before invoking the kernel.
+                # Older FlashInfer kernels require logits; use precomputed
+                # routes when the selected kernel advertises that capability.
                 routing_mode=(
                     None
                     if get_moe_backend().is_flashinfer_trtllm()
@@ -2047,7 +2044,7 @@ class DeepseekV4MoE(nn.Module):
         topk_ids: torch.Tensor,
         router_scores: torch.Tensor,
     ):
-        if self.experts.topk_output_format.is_bypassed():
+        if not self.experts.supports_precomputed_topk:
             router_logits = pack_topk_as_router_logits(
                 topk_weights, topk_ids, self.config.n_routed_experts
             )
@@ -3743,6 +3740,18 @@ class DeepseekV4Model(nn.Module):
 
 class DeepseekV4ForCausalLM(BaseCausalLM):
     model_cls = DeepseekV4Model
+
+    def resolve_lm_head(
+        self,
+        config: PretrainedConfig,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> nn.Module:
+        # V4 checkpoints store the LM head as BF16 without FP8 scales even when
+        # the rest of the model declares serialized FP8 quantization.
+        if self.mapping.attn.has_dp and isinstance(quant_config, Fp8Config):
+            quant_config = None
+        return super().resolve_lm_head(config, quant_config, prefix)
 
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
         self.capture_aux_hidden_states = True

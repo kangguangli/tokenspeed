@@ -24,7 +24,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
-#include <map>
 #include <optional>
 #include <set>
 #include <span>
@@ -41,7 +40,15 @@ namespace tokenspeed {
 // CacheBlock pointer, or ownership count.
 class BlockPool {
 public:
-    explicit BlockPool(std::int32_t num_lcm_blocks) : lcm_blocks_(checkedLcmBlockCount(num_lcm_blocks)) {
+    explicit BlockPool(std::int32_t num_lcm_blocks, std::vector<std::int32_t> slots_per_group)
+        : lcm_blocks_(checkedLcmBlockCount(num_lcm_blocks)), group_availability_(slots_per_group.size()) {
+        for (std::size_t group_id = 0; group_id < slots_per_group.size(); ++group_id) {
+            const auto packing = slots_per_group[group_id];
+            _assert(packing > 0, "slots_per_parent must be > 0");
+            _assert(static_cast<std::int64_t>(num_lcm_blocks) * packing <= std::numeric_limits<std::int32_t>::max(),
+                    "group cache page count exceeds int32 range");
+            group_availability_[group_id].packing = packing;
+        }
         for (std::int32_t id = 1; id <= num_lcm_blocks; ++id) {
             free_parent_ids_.push_back(id);
         }
@@ -55,15 +62,19 @@ public:
     std::int32_t NumLcmBlocks() const noexcept { return static_cast<std::int32_t>(lcm_blocks_.size()); }
     std::int32_t NumEmptyLcmBlocks() const noexcept { return static_cast<std::int32_t>(free_parent_ids_.size()); }
 
+    // Unoccupied child slots in parents already bound to this group.
+    std::int32_t NumFreeSlots(std::uint32_t group_id) const noexcept {
+        return static_cast<std::int32_t>(placement(group_id).free_slots);
+    }
+
     // Fix placement geometry before this group allocates any blocks. Repeated
     // registration is allowed only with the same geometry, including after free.
-    void RegisterGroup(std::uint32_t group_id, std::int32_t packing, std::int32_t shard_count = 1) {
+    void RegisterGroup(std::uint32_t group_id, std::int32_t packing, std::int32_t shard_count) {
         _assert(packing > 0 && shard_count > 0 && packing % shard_count == 0,
                 "shard_count must be positive and divide parent packing");
-        auto [it, inserted] = group_availability_.try_emplace(group_id);
-        GroupAvailability& group = it->second;
-        if (inserted) {
-            group.packing = packing;
+        GroupAvailability& group = placement(group_id);
+        _assert(group.packing == packing, "cache group packing changed after construction");
+        if (group.parents_by_bucket.empty()) {
             group.parents_by_bucket.resize(static_cast<std::size_t>(shard_count));
         } else {
             _assert(group.packing == packing && group.parents_by_bucket.size() == static_cast<std::size_t>(shard_count),
@@ -71,24 +82,27 @@ public:
         }
     }
 
-    CacheBlockRef AcquireBlock(std::uint32_t group_id, std::int32_t cache_blocks_per_lcm_block) {
-        std::vector<CacheBlockRef> blocks = AcquireBlocks(group_id, cache_blocks_per_lcm_block, 1);
+    CacheBlockRef AcquireBlock(std::uint32_t group_id) {
+        std::vector<CacheBlockRef> blocks = AcquireBlocks(group_id, 1);
         if (blocks.empty()) {
             return {};
         }
         return std::move(blocks.front());
     }
 
-    std::vector<CacheBlockRef> AcquireBlocks(std::uint32_t group_id, std::int32_t cache_blocks_per_lcm_block,
-                                             std::int32_t num, std::span<const std::int32_t> bucket_loads = {}) {
-        _assert(cache_blocks_per_lcm_block > 0, "cache_blocks_per_lcm_block must be > 0");
+    std::vector<CacheBlockRef> AcquireBlocks(std::uint32_t group_id, std::int32_t num) {
+        return AcquireBlocks(group_id, num, {});
+    }
+
+    std::vector<CacheBlockRef> AcquireBlocks(std::uint32_t group_id, std::int32_t num,
+                                             std::span<const std::int32_t> bucket_loads) {
+        const auto cache_blocks_per_lcm_block = placement(group_id).packing;
         if (num <= 0) {
             return {};
         }
 
         if (bucket_loads.size() > 1) {
-            const auto it = group_availability_.find(group_id);
-            _assert(it != group_availability_.end() && it->second.parents_by_bucket.size() == bucket_loads.size(),
+            _assert(placement(group_id).parents_by_bucket.size() == bucket_loads.size(),
                     "allocation loads must match the registered shard_count");
             for (std::int32_t load : bucket_loads) {
                 _assert(load >= 0, "allocation bucket loads must be non-negative");
@@ -100,36 +114,31 @@ public:
         return acquireAvailableBlocks(group_id, cache_blocks_per_lcm_block, num, bucket_loads);
     }
 
-    std::vector<CacheBlockRef> AcquireUpToBlocks(std::uint32_t group_id, std::int32_t cache_blocks_per_lcm_block,
-                                                 std::int32_t max_num) {
-        _assert(cache_blocks_per_lcm_block > 0, "cache_blocks_per_lcm_block must be > 0");
+    std::vector<CacheBlockRef> AcquireUpToBlocks(std::uint32_t group_id, std::int32_t max_num) {
+        const auto cache_blocks_per_lcm_block = placement(group_id).packing;
         if (max_num <= 0) {
             return {};
         }
         const auto take = static_cast<std::int32_t>(
             std::min(static_cast<std::size_t>(max_num), availableBlocks(group_id, cache_blocks_per_lcm_block)));
-        return take > 0 ? acquireAvailableBlocks(group_id, cache_blocks_per_lcm_block, take)
+        return take > 0 ? acquireAvailableBlocks(group_id, cache_blocks_per_lcm_block, take, {})
                         : std::vector<CacheBlockRef>{};
     }
 
-    std::vector<CacheBlockRef> AcquireAvailableBlocksInOrder(std::span<const std::uint32_t> group_ids,
-                                                             std::span<const std::int32_t> cache_blocks_per_group) {
+    std::vector<CacheBlockRef> AcquireAvailableBlocksInOrder(std::span<const std::uint32_t> group_ids) {
         for (std::uint32_t group_id : group_ids) {
-            _assert(group_id < cache_blocks_per_group.size(), "group id has no packing");
-            _assert(cache_blocks_per_group[group_id] > 0, "cache_blocks_per_lcm_block must be > 0");
-            (void)availableBlocks(group_id, cache_blocks_per_group[group_id]);
+            (void)placement(group_id);
         }
         std::vector<CacheBlockRef> out(group_ids.size());
         for (std::size_t i = 0; i < group_ids.size(); ++i) {
-            out[i] = AcquireBlock(group_ids[i], cache_blocks_per_group[group_ids[i]]);
+            out[i] = AcquireBlock(group_ids[i]);
         }
         return out;
     }
 
-    std::vector<CacheBlockRef> AcquireUpToBlocksFromEmptyParent(std::uint32_t group_id,
-                                                                std::int32_t cache_blocks_per_lcm_block,
-                                                                std::int32_t lcm_block_id, std::int32_t max_num) {
-        _assert(cache_blocks_per_lcm_block > 0, "cache_blocks_per_lcm_block must be > 0");
+    std::vector<CacheBlockRef> AcquireUpToBlocksFromEmptyParent(std::uint32_t group_id, std::int32_t lcm_block_id,
+                                                                std::int32_t max_num) {
+        const auto cache_blocks_per_lcm_block = placement(group_id).packing;
         if (max_num <= 0) {
             return {};
         }
@@ -188,7 +197,7 @@ public:
                    "CacheBlock location has invalid slot");
         const std::size_t slot = static_cast<std::size_t>(location.slot_index);
         FatalCheck(parent.occupancy[slot] && parent.occupied_count > 0, "CacheBlock location is not occupied");
-        GroupAvailability& group = group_availability_.at(*parent.bound_group);
+        GroupAvailability& group = placement(*parent.bound_group);
         removeAvailability(group, parent, location.lcm_block_id);
         parent.occupancy[slot] = false;
         --parent.occupied_count;
@@ -224,13 +233,19 @@ private:
         std::vector<std::int32_t> first_free_slots;
     };
 
+    const GroupAvailability& placement(std::uint32_t group_id) const noexcept {
+        FatalCheck(group_id < group_availability_.size(), "group id has no placement in this pool");
+        return group_availability_[group_id];
+    }
+    GroupAvailability& placement(std::uint32_t group_id) noexcept {
+        FatalCheck(group_id < group_availability_.size(), "group id has no placement in this pool");
+        return group_availability_[group_id];
+    }
+
     std::size_t availableBlocks(std::uint32_t group_id, std::int32_t packing) const {
-        const auto it = group_availability_.find(group_id);
-        if (it != group_availability_.end()) {
-            _assert(it->second.packing == packing, "cache group packing changed after registration");
-        }
-        const std::size_t holes = it == group_availability_.end() ? 0 : it->second.free_slots;
-        return holes + free_parent_ids_.size() * static_cast<std::size_t>(packing);
+        const auto& group = placement(group_id);
+        _assert(group.packing == packing, "cache group packing changed after construction");
+        return group.free_slots + free_parent_ids_.size() * static_cast<std::size_t>(packing);
     }
 
     static void removeAvailability(GroupAvailability& group, const LcmBlock& parent, std::int32_t id) {
@@ -257,10 +272,10 @@ private:
 
     GroupAvailability& prepareAvailability(std::uint32_t group_id, std::int32_t packing) {
         (void)availableBlocks(group_id, packing);
-        if (!group_availability_.contains(group_id)) {
-            RegisterGroup(group_id, packing);
+        if (placement(group_id).parents_by_bucket.empty()) {
+            RegisterGroup(group_id, packing, 1);
         }
-        return group_availability_.at(group_id);
+        return placement(group_id);
     }
 
     CacheBlockLocation nextLocation(const GroupAvailability& group, std::span<const std::int64_t> loads) const {
@@ -292,7 +307,7 @@ private:
     }
 
     std::vector<CacheBlockRef> acquireAvailableBlocks(std::uint32_t group_id, std::int32_t packing, std::int32_t count,
-                                                      std::span<const std::int32_t> bucket_loads = {}) {
+                                                      std::span<const std::int32_t> bucket_loads) {
         const bool balanced = bucket_loads.size() > 1;
         GroupAvailability& group = prepareAvailability(group_id, packing);
         std::vector<std::int64_t> loads;
@@ -336,7 +351,7 @@ private:
 
     void occupy(std::uint32_t group_id, std::int32_t slots_per_parent, CacheBlockLocation location) noexcept {
         LcmBlock& parent = lcm_blocks_[static_cast<std::size_t>(location.lcm_block_id - 1)];
-        GroupAvailability& group = group_availability_.at(group_id);
+        GroupAvailability& group = placement(group_id);
         const std::size_t buckets = group.parents_by_bucket.size();
         if (parent.occupied_count == 0) {
             FatalCheck(!free_parent_ids_.empty() && free_parent_ids_.front() == location.lcm_block_id,
@@ -383,7 +398,9 @@ private:
     // Free parents are interchangeable: release appends and allocation consumes
     // the front. Bound parents have per-group, per-bucket availability indices.
     std::deque<std::int32_t> free_parent_ids_;
-    std::map<std::uint32_t, GroupAvailability> group_availability_;
+    // Dense group IDs and immutable packing are configured at construction.
+    // Bucket geometry is fixed by registration before the first allocation.
+    std::vector<GroupAvailability> group_availability_;
 };
 
 }  // namespace tokenspeed

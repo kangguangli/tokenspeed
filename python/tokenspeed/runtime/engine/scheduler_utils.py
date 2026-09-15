@@ -40,6 +40,7 @@ from tokenspeed_scheduler import (
     SchedulerConfig,
 )
 
+from tokenspeed.runtime.execution.types import NGramInputs
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     require_positive_int,
 )
@@ -66,6 +67,58 @@ _TRANSFER_POLICY_MAP = {
     "full_suffix": CacheTransferPolicy.FullSuffix,
     "latest_snapshot": CacheTransferPolicy.LatestSnapshot,
 }
+
+
+def engram_context_len(text_config) -> int:
+    """Select caller-owned Engram inputs, not Qwen4's LCM-owned PLE state."""
+    if not getattr(text_config, "engram_layer_ids", ()):
+        return 0
+    if getattr(text_config, "ngram_context_len", None) != 3:
+        raise ValueError("Engram requires hf_text_config.ngram_context_len = 3")
+    return text_config.ngram_context_len
+
+
+def ngram_inputs_for_forward(
+    forward_op, rid_to_state: Mapping, context_len: int
+) -> NGramInputs | None:
+    """Snapshot one bounded seed window per request, including empty prefills.
+
+    Each row is [current, prev1..3] at the extend prefix or the newest committed
+    decode token. Prompt/output lists contain physical IDs, unlike the unpadded
+    detokenizer prompt. The executor uses these immutable windows to seed/reset
+    its accepted input tail; ongoing decode and proposed predecessors stay on
+    the device, even when an entire verify result awaits its host commit.
+    """
+    if context_len == 0:
+        return None
+    tokens, positions = [], []
+    num_extends = forward_op.num_extends()
+    for i, rid in enumerate(forward_op.request_ids):
+        state = rid_to_state[rid]
+        prompt, output = state.prompt_input_ids, state.output_ids
+        prompt_len = len(prompt)
+        total = prompt_len + len(output)
+        length = forward_op.input_lengths[i]
+        if i < num_extends:
+            start = forward_op.extend_prefix_lens[i]
+            if start < 0 or start + length > total:
+                raise ValueError(f"N-gram prefill exceeds physical tokens for {rid}")
+        else:
+            start = total - 1
+            if start < 0:
+                raise ValueError(f"N-gram decode requires physical tokens for {rid}")
+        tokens.append(
+            tuple(
+                (
+                    -1
+                    if p < 0 or p >= total
+                    else prompt[p] if p < prompt_len else output[p - prompt_len]
+                )
+                for p in range(start, start - context_len - 1, -1)
+            )
+        )
+        positions.append(start)
+    return NGramInputs(tokens=tuple(tokens), positions=tuple(positions))
 
 
 @dataclass(frozen=True)
@@ -157,7 +210,6 @@ def make_config(
     prefix_granularity: int,
     num_host_pages: int,
     disable_l2_cache: bool,
-    enable_l3_storage: bool,
     role: str,
     enable_kv_cache_events: bool = False,
     decode_input_tokens: int = 1,
@@ -179,7 +231,8 @@ def make_config(
     cfg.prefix_granularity = prefix_granularity
 
     cfg.num_host_pages = num_host_pages
-    cfg.enable_l3_storage = enable_l3_storage
+    # The runtime cache executor supports device and host tiers only.
+    cfg.enable_l3_storage = False
     cfg.enable_kv_cache_events = enable_kv_cache_events
 
     if role == "prefill":

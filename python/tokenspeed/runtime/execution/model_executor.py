@@ -39,6 +39,7 @@ from tokenspeed.runtime.configs.utils import get_rope_parameters
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
+from tokenspeed.runtime.engine.scheduler_utils import engram_context_len
 from tokenspeed.runtime.execution.breakable_cuda_graph import active_forward
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.drafter import get_drafter_impl
@@ -57,6 +58,7 @@ from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 from tokenspeed.runtime.execution.types import (
     DpForwardMetadata,
     ModelExecutionResult,
+    NGramInputs,
 )
 from tokenspeed.runtime.execution.workspace import workspace_pool
 from tokenspeed.runtime.grammar.capturable_grammar import (
@@ -87,7 +89,7 @@ from tokenspeed.runtime.sampling.dp_sampling_config import (
     setup_dp_sampling,
 )
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
-from tokenspeed.runtime.utils import get_colorful_logger, set_random_seed
+from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.common import maybe_inference_mode
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.hf_transformers_utils import get_context_length
@@ -346,16 +348,25 @@ class ModelExecutor:
         spec_num_tokens = config.spec_num_tokens if config.spec_algo is not None else 1
         self.input_buffers = InputBuffers(
             max_bs=max_bs,
-            max_num_tokens=config.chunked_prefill_size,
+            max_num_tokens=max(
+                config.chunked_prefill_size, max_bs * config.output_length
+            ),
             state_write_padding_pool_index=config.max_req_pool_size,
             device=self.device,
         )
+        ngram_context = engram_context_len(model_runner.model_config.hf_text_config)
+        if ngram_context and (config.pp_size != 1 or config.overlap_schedule_depth > 1):
+            raise NotImplementedError(
+                "Engram input history requires PP=1 and in-flight depth <= 1"
+            )
+        self.input_buffers.init_ngram_buffers(ngram_context)
         self.runtime_states = RuntimeStates(
             req_pool_size=config.max_req_pool_size,
             vocab_size=config.vocab_size,
             device=self.device,
             output_length=config.output_length,
         )
+        self.runtime_states.init_ngram_state(ngram_context)
         # Sized like InputBuffers.max_bs so the padded graph-bucket bs fits.
         self.nan_guard = NanGuard.create(
             config.enable_nan_detection,
@@ -482,15 +493,6 @@ class ModelExecutor:
             graph_supported=graph_support.prefill_graph,
         )
 
-        self._autotune()
-
-        workspace_pool(self.device).freeze()
-
-        if not self.forward_step.disable:
-            self.forward_step.capture()
-        if not self.prefill_graph.disable:
-            self.prefill_graph.capture(self.forward_step)
-
         # Encoder graphs are installed before KV-cache sizing and retained by
         # the model runner; preserve the executor-level handle for callers.
         self.encoder_graph_wrappers = getattr(
@@ -527,9 +529,25 @@ class ModelExecutor:
             device=self.device,
         )
 
-        set_random_seed(48)
-
         logger.info("ModelExecutor initialized")
+
+    def capture_graphs(self) -> None:
+        """Tune the kernels, pin the workspace, then capture the graphs.
+
+        A step of its own, so the caller decides when the graph owners start
+        recording the pools' buffers. Construction has already read the pools
+        (validation, configure_runtime, bind_cache_groups and the runners'
+        init_cuda_graph_state), so a caller that rebinds between the two
+        re-runs those itself.
+        """
+        self._autotune()
+
+        workspace_pool(self.device).freeze()
+
+        if not self.forward_step.disable:
+            self.forward_step.capture()
+        if not self.prefill_graph.disable:
+            self.prefill_graph.capture(self.forward_step)
 
     def _autotune(self) -> None:
         """Profile tunable kernels over one dummy prefill before graph capture.
@@ -589,6 +607,11 @@ class ModelExecutor:
         tic = time.time()
         set_autotune_process_group(cpu_group)
         with autotune(), maybe_inference_mode():
+            # Reuse idle's dummy-input scrub before prefill writes its geometry;
+            # borrowed Engram views must not retain live history or masks.
+            ib.fill_dummy_decode_buffers(
+                batch_size=ib.max_bs, total_tokens=ib.max_num_tokens
+            )
             ctx = self.prefill_graph.make_dummy_batch(num_tokens)
             positions = (
                 ib.mrope_positions_buf[:, :num_tokens]
@@ -600,6 +623,7 @@ class ModelExecutor:
                     ctx=ctx,
                     input_ids=ib.input_ids_buf[:num_tokens],
                     positions=positions,
+                    **ib.ngram_model_kwargs(num_tokens),
                 )
         set_autotune_process_group(None)
         torch.get_device_module(self.device).synchronize()
@@ -713,6 +737,7 @@ class ModelExecutor:
                 self.input_buffers.input_ids_buf[: ctx.input_num_tokens],
                 positions,
                 pp_inbound=pp_inbound,
+                **self.input_buffers.ngram_model_kwargs(ctx.input_num_tokens),
             )
             return output
         # Prefill-graph replay when captured for this forward (the decode graph
@@ -733,6 +758,7 @@ class ModelExecutor:
             self.input_buffers.input_ids_buf[: ctx.input_num_tokens],
             positions,
             multimodal_context=self._active_multimodal_context,
+            **self.input_buffers.ngram_model_kwargs(ctx.input_num_tokens),
         )
 
     def _apply_force_single_token_verify(
@@ -952,11 +978,11 @@ class ModelExecutor:
         input_lengths: torch.Tensor,
         num_extends: int,
     ):
-        """Write output tokens to future_input_map and update cache lengths.
+        """Advance accepted inputs and cache lengths together on execution_stream.
 
-        Must NOT be captured in CUDA graph — these writes are read by the
-        next iteration's batch prep on the default stream, so they need
-        explicit stream synchronization (see execute_forward_op).
+        Serving calls this after eager execution or graph replay. All writes
+        are tensor-only, including padding masks, so recording this update has
+        the same semantics. Callers must pass the state-write pool indices.
         """
         if self.drafter is None:
             # Without drafter, store output tokens for next round.
@@ -978,6 +1004,29 @@ class ModelExecutor:
         else:
             deltas = torch.cat(
                 [input_lengths[:num_extends], accept_lengths[num_extends:]]
+            )
+        ib = self.input_buffers
+        live = req_pool_indices != ib.state_write_padding_pool_index
+        deltas = torch.where(live, deltas, 0)
+        tail = self.runtime_states.ngram_accepted_tokens
+        if tail is not None:
+            assert ib.ngram_previous_tokens_buf is not None
+            assert ib.ngram_token_mask_buf is not None
+            # A accepted inputs end at row A-1, NOT at the sampled bonus or
+            # the end of the proposed window. Masks retain raw OOV barriers
+            # after input_ids_buf has been clamped for the embedding lookup.
+            last_rows = (input_lengths.cumsum(0) - input_lengths + deltas - 1).clamp(
+                0, ib.max_num_tokens - 1
+            )
+            current = torch.where(
+                ib.ngram_token_mask_buf[last_rows], ib.input_ids_buf[last_rows], -1
+            )
+            accepted_tail = torch.cat(
+                [current[:, None], ib.ngram_previous_tokens_buf[last_rows, :-1]],
+                dim=1,
+            )
+            tail[req_pool_indices] = torch.where(
+                (deltas > 0)[:, None], accepted_tail, tail[req_pool_indices]
             )
         self.runtime_states.update_valid_cache_length(req_pool_indices, deltas)
 
@@ -1053,6 +1102,7 @@ class ModelExecutor:
             ctx,
             input_ids=empty,
             positions=empty,
+            **self.input_buffers.ngram_model_kwargs(0),
         )
 
         # If a drafter is active, its model also has MoE layers that issue
@@ -1238,6 +1288,8 @@ class ModelExecutor:
         grammar_inputs=None,
         multimodal_context=None,
         capture_next_input_ids: bool = False,
+        *,
+        ngram_inputs: NGramInputs | None,
     ) -> ModelExecutionResult:
         self._reset_valid_cache_length(forward_op)
         self.log_step += 1
@@ -1280,6 +1332,7 @@ class ModelExecutor:
                 forward_op=forward_op,
                 runtime_states=self.runtime_states,
                 total_tokens=total_tokens,
+                ngram_inputs=ngram_inputs,
             )
             if self.drafter is not None and hasattr(
                 self.drafter, "prepare_request_state"
@@ -1447,7 +1500,9 @@ class ModelExecutor:
 
                 # Update runtime state on execution_stream (NOT in the CUDA graph).
                 self._update_runtime_state(
-                    req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],
+                    req_pool_indices=self.input_buffers.state_write_req_pool_indices_buf[
+                        :bs
+                    ],
                     output_tokens=output_tokens,
                     accept_lengths=output_lengths,
                     input_lengths=self.input_buffers.input_lengths_buf[:bs],

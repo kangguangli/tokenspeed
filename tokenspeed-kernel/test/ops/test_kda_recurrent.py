@@ -6,11 +6,11 @@ from inspect import signature
 from types import SimpleNamespace
 
 import pytest
+import tokenspeed_kernel.ops.attention.kda as attention_ops
 import torch
 from kimi3_reference import kda_gate
 from kimi3_reference import kda_recurrent as reference_kda_recurrent
-from tokenspeed_kernel.ops import attention as attention_ops
-from tokenspeed_kernel.ops.attention import (
+from tokenspeed_kernel.ops.attention.kda import (
     KdaPrefillResult,
     _attention_format_signature,
     kda_paged_decode,
@@ -111,7 +111,7 @@ def test_kda_prefill_relayouts_only_for_declaring_kernels(
     ],
 )
 def test_kda_verify_bv_routing(batch_size, value_dim, store_states, expected) -> None:
-    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import _kda_verify_bv
+    from tokenspeed_kernel.ops.attention.kda._triton.recurrent import _kda_verify_bv
 
     assert _kda_verify_bv(batch_size, value_dim, store_states) == expected
 
@@ -122,7 +122,7 @@ def test_kda_verify_bv_routing(batch_size, value_dim, store_states, expected) ->
 )
 def test_kda_verify_split_launch_routing(batch_size, expected) -> None:
     """Both routed knobs, including where the wide-block window closes."""
-    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+    from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
         _kda_verify_launch_config,
     )
 
@@ -141,7 +141,7 @@ def test_kda_verify_split_launch_routing(batch_size, expected) -> None:
 
 
 def test_kda_verify_split_launch_requires_both_hoists_and_honors_overrides() -> None:
-    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+    from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
         _kda_verify_launch_config,
     )
 
@@ -178,7 +178,7 @@ def test_kda_verify_split_launch_requires_both_hoists_and_honors_overrides() -> 
 def test_glm53_flash_mtp_schedules_match_reference_and_replay() -> None:
     """The TP4 schedules match the recurrence and graph replay is stable."""
     from tokenspeed_kernel._triton import triton
-    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+    from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
         fused_recurrent_kda_mtp,
         fused_recurrent_kda_mtp_fwd_kernel,
     )
@@ -342,7 +342,7 @@ def test_glm53_flash_mtp_schedules_match_reference_and_replay() -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_mtp_direct_committed_read_matches_seeded_scratch_and_replays() -> None:
     """Separate read/write pools replace the recurrent-state seed exactly."""
-    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+    from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
         fused_recurrent_kda_mtp,
     )
 
@@ -683,19 +683,19 @@ def test_nvidia_kda_verify_and_decode_registration_traits(
 
 
 @pytest.mark.parametrize(
-    "kernel_name",
+    ("kernel_name", "layout"),
     [
-        "triton_nvidia_kda_paged_prefill",
-        "flashkda_nvidia_kda_paged_prefill",
-        "cutedsl_kda_nvidia_paged_prefill",
+        ("triton_nvidia_kda_paged_prefill", "k_major"),
+        ("flashkda_nvidia_kda_paged_prefill", "k_major"),
+        ("cutedsl_kda_nvidia_paged_prefill", "v_major"),
     ],
 )
-def test_nvidia_kda_prefill_kernels_declare_k_major(kernel_name) -> None:
+def test_nvidia_kda_prefill_kernels_declare_native_layout(kernel_name, layout) -> None:
     """kda_paged_prefill relayouts only for kernels that declare a layout;
     a dropped declaration silently hands them the V-major state as-is."""
     spec = KernelRegistry.get().get_by_name(kernel_name)
     assert spec is not None, kernel_name
-    assert spec.traits.get("recurrent_layout") == frozenset({"k_major"}), kernel_name
+    assert spec.traits.get("recurrent_layout") == frozenset({layout}), kernel_name
 
 
 def test_kda_replay_supported_on_the_nvidia_serving_platform(b300_platform) -> None:
@@ -833,7 +833,7 @@ def test_kda_decode_and_replay_select_layout_trait(
 
 
 def test_nvidia_kda_pool_matches_the_reference_recurrence() -> None:
-    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+    from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
         fused_recurrent_kda_pool,
     )
 
@@ -1448,7 +1448,7 @@ def _megafuse_inputs(batch: int, seed: int = 17):
 def _run_megafuse(inp, *, fused: bool):
     """One megafuse decode, with the norm epilogue fused in or applied after."""
     from tokenspeed_kernel.ops.activation.triton import rmsnorm_gated_sigmoid
-    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+    from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
         fused_recurrent_kda_megafuse,
     )
 

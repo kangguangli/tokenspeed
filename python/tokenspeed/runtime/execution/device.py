@@ -418,6 +418,7 @@ class DeviceHandle:
                 grammar_inputs=planned.grammar_inputs,
                 multimodal_context=planned.multimodal_context,
                 capture_next_input_ids=capture_next_input_ids,
+                ngram_inputs=planned.ngram_inputs,
             )
 
         return PendingExecution(self._thread.submit(_forward))
@@ -647,11 +648,11 @@ def build_device_side(
     control face and the encoder-facts callable it consumes at startup, and
     the handle it runs with.
 
-    The chain is linear and the order is load-bearing: the multimodal
-    runtime must be prepared after weights are loaded and before
-    ``create_attn_components`` profiles memory for the KV budget, and the
-    chunked-prefill limit must be aligned to the cache groups before
-    ``ModelExecutorConfig`` sizes the input buffers from it.
+    The chain is linear and the order is load-bearing: the multimodal runtime
+    and persistent communication buffers must be prepared after weights are
+    loaded and before ``create_attn_components`` profiles memory for the KV
+    budget, and the chunked-prefill limit must be aligned to the cache groups
+    before ``ModelExecutorConfig`` sizes the input buffers from it.
 
     Args:
         server_args: Parsed server arguments. ``chunked_prefill_size`` may
@@ -690,7 +691,7 @@ def build_device_side(
     from tokenspeed.runtime.layers.attention.registry import (
         create_attn_components,
     )
-    from tokenspeed.runtime.utils import get_colorful_logger
+    from tokenspeed.runtime.utils import get_colorful_logger, set_random_seed
 
     logger = get_colorful_logger(__name__)
 
@@ -699,6 +700,18 @@ def build_device_side(
     )
     if server_args.disaggregation_mode in ("null", "prefill"):
         target.prepare_multimodal_runtime()
+    max_forward_tokens = (
+        server_args.chunked_prefill_size
+        if server_args.chunked_prefill_size > 0
+        else server_args.max_prefill_tokens + server_args.max_model_len
+    )
+    max_forward_tokens = max(
+        max_forward_tokens,
+        max_batch_size * decode_input_tokens,
+    )
+    target.prepare_communication_runtime(max_forward_tokens)
+    if draft is not None:
+        draft.prepare_communication_runtime(max_forward_tokens)
 
     (
         attn_backend,
@@ -755,6 +768,9 @@ def build_device_side(
         draft_attn_backend=draft_attn_backend,
         draft_token_to_kv_pool=draft_token_to_kv_pool,
     )
+    executor.capture_graphs()
+    # Tuning and capture draw from the generator; this is the state startup leaves.
+    set_random_seed(48)
 
     # Per-rank GPU memory breakdown (weights by group, KV/graph/non-torch).
     if attn_tp_rank == 0:
@@ -771,11 +787,6 @@ def build_device_side(
 
     l2_cache_executor = None
     if server_args.enable_kvstore:
-        if server_args.kvstore_storage_backend is not None:
-            raise NotImplementedError(
-                "the cache-group scheduler has no L3 storage tier; unset "
-                "--kvstore-storage-backend"
-            )
         from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor
 
         l2_cache_executor = L2CacheExecutor(
