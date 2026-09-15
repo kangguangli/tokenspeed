@@ -704,11 +704,29 @@ publisher of `CacheRuntimeContract`, whose virtual counts and packing derive
 from these physical facts and each spec's `shard_count`. No separate placement
 or per-group address-space object is needed.
 
+A recipe's group set never depends on the DCP size. Only groups whose every
+reader can attend to a shard may be sharded; a group some consumer must read
+whole stays replicated and is declared as its own group at every DCP size, so
+prefix matching, transfer and zeroing -- all keyed by group -- see one
+topology. DeepSeek V4 shards its compressed-KV chains and keeps the SWA cache,
+the compressor states and the indexer's K replicated; the indexer K is its own
+full-history group rather than a tenant of the compressed chain it indexes.
+
 Splitting or regrouping fields can change physical packing and parent plane
 sizes. Capacity planning therefore uses the resulting physical parent byte
-size and each group's declared demand. Virtual placement alone does not impose
-a fixed parent size across different group declarations; field alignment and
-bounds remain the physical planner's responsibility.
+size and each group's declared demand: a replicated full-history group holds
+one physical child per token span where a sharded one holds one per
+`shard_count` spans, so the replicated groups bound the token capacity.
+Virtual placement alone does not impose a fixed parent size across different
+group declarations; field alignment and bounds remain the physical planner's
+responsibility, and the padding bound applies unchanged.
+
+Translation from virtual to local IDs is one operation with `shard_count` as
+a parameter, never a mode: a replicated group translates to itself minus the
+null block, so batch metadata refreshes its local read tables, writers mask
+unowned rows, and zeroing filters foreign blocks through the same path at
+every DCP size. Virtual block 0 is the null block; no path writes to it, at
+any DCP size.
 
 Consumers bind a pool's compute view and read its arena's runtime contract.
 Views sharing an arena share that contract, rather than accepting separately
@@ -757,9 +775,9 @@ returns before changing the indices, occupancy, or FIFO. Ordinary, balanced,
 and Host allocation entry points use the same availability updates.
 
 Choosing a block examines the bucket-index heads, not every parent. Updating
-the chosen parent's ordering costs logarithmic time in the number of indexed
-parents per bucket. Advancing its free-slot cursor only searches that bucket
-within that parent. Ordinary and balanced calls share the registered geometry;
+the chosen parent's ordering costs one logarithmic-time index update per
+bucket the parent has a hole in. Advancing its free-slot cursor only searches
+that bucket within that parent. Ordinary and balanced calls share the registered geometry;
 changing the shard count or packing is rejected even after every block is
 released. No allocation call rebuilds the group's indices for new geometry.
 The additional metadata is per-parent bucket minima and at most one tree

@@ -97,14 +97,17 @@ class DeepseekV4IndexerBatchMetadata:
 class DeepseekV4AttentionMetadata:
     swa_indices: torch.Tensor | None = None
     swa_lens: torch.Tensor | None = None
-    decode_dcp_zero_swa_lens: torch.Tensor | None = None
+    # All-zero lengths shaped like ``swa_lens``: the SWA cache is replicated
+    # across a DCP group, so every rank but the first attends to none of it.
+    swa_lens_none: torch.Tensor | None = None
     swa_window_size: int = 0
     swa_block_size: int = 0
     # Cache for dense compressed decode attention indices/lens. CSA decode uses
     # dynamic top-k indices and does not populate this cache.
+    # (indices, scan lens, owned-row counts) per dense compressed decode key.
     decode_dense_compressed_indices_cache: dict[
         tuple[int, int, int, int],
-        tuple[torch.Tensor, torch.Tensor, torch.Tensor | None],
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     ] = field(default_factory=dict)
     decode_dense_compressed_indices_capture_safe_keys: set[
         tuple[int, int, int, int]

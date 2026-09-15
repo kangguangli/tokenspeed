@@ -139,7 +139,7 @@ def _refresh_decode_indexer_plan_cache(
             continue
         positions = _decode_positions_from_metadata(metadata, num_tokens)
         token_to_req_indices = metadata.token_to_req_indices[:num_tokens]
-        page_table = metadata.cache.compressed_page_table(compress_ratio, indexer=True)
+        page_table = metadata.cache.indexer_page_table()
         rows = int(page_table.shape[0]) if page_table.ndim >= 1 else 0
         cols = int(page_table.shape[1]) if page_table.ndim >= 2 else 0
         if rows <= 0 or cols <= 0:
@@ -296,10 +296,13 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         # init_cuda_graph_state (unconditionally at wrapper construction).
         self.graph: DeepseekV4GraphBuffers | None = None
         self._init_cache_group_latches()
-        self.dcp_size = getattr(config, "dcp_size", 1)
-        self.dcp_rank = getattr(config, "dcp_rank", 0)
-        self.dcp_group = getattr(config, "dcp_group", ())
-        self._decode_dcp_q_padding_workspace: torch.Tensor | None = None
+        # The DCP topology is one more parameter of the decode path: a group
+        # of one attends to a fully replicated cache and combines nothing.
+        self.dcp_size = int(config.dcp_size)
+        self.dcp_rank = int(config.dcp_rank)
+        self.dcp_group = tuple(config.dcp_group)
+        if len(self.dcp_group) != self.dcp_size or self.dcp_rank >= self.dcp_size:
+            raise ValueError("DeepSeek V4 DCP group, size and rank disagree")
         self._cuda_graph_active_page_validity: torch.Tensor | None = None
         self._prefill_workspace_buffer: torch.Tensor | None = None
         self._prefill_workspace_rows = 0
@@ -307,11 +310,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self._prefill_dense_compressed_indices_buffer: torch.Tensor | None = None
         # FlashMLA SM100 decode requires a padded query-head width. Calls using
         # one backend are stream ordered, so only the valid prefix needs to be
-        # refreshed after the zero-tailed workspace is initialized.
-        self._decode_q_padding_workspace: torch.Tensor | None = None
-        self._decode_q_padding_workspace_layout: (
-            tuple[torch.device, torch.dtype, int, int, int] | None
-        ) = None
+        # refreshed after the zero-tailed workspaces are initialized. Keyed by
+        # the unpadded head count they pad.
+        self._decode_q_padding_workspaces: dict[int, torch.Tensor] = {}
         self._swa_window_size = 0
         self._swa_block_size = 0
         self.speculative_num_steps = int(config.speculative_num_steps)
@@ -504,10 +505,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self._cache_group_max_page_ids = contract.max_page_ids
         # Sized from the old pool's page counts; init_cuda_graph_state rebuilds them.
         self.graph = None
-        self._decode_dcp_q_padding_workspace = None
         self._cuda_graph_active_page_validity = None
-        self._decode_q_padding_workspace = None
-        self._decode_q_padding_workspace_layout = None
+        self._decode_q_padding_workspaces = {}
         self.draft_rounds = None
         self.forward_metadata = None
         self.forward_prefill_metadata = None
@@ -526,12 +525,23 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             kwargs.pop("cache_group_page_counts", None),
         )
 
-    def _prepare_cache_metadata(self, cache: DeepseekV4CacheMetadata) -> None:
-        """Bind placement and refresh local read tables without rebinding storage."""
-        cache.dcp_size = self.dcp_size
-        cache.dcp_rank = self.dcp_rank
-        cache.runtime_contract = self.cache_pool.arena.runtime_contract
-        cache.prepare_compressed_attention_page_tables()
+    def _cache_metadata(
+        self,
+        *,
+        page_table: torch.Tensor,
+        block_tables: dict[str, torch.Tensor],
+    ) -> DeepseekV4CacheMetadata:
+        """Cache metadata over these scheduler tables, read views prepared."""
+        cache = DeepseekV4CacheMetadata.from_group_tables(
+            page_size=self.kernel_page_size,
+            page_table=page_table,
+            block_tables=block_tables,
+            dcp_size=self.dcp_size,
+            dcp_rank=self.dcp_rank,
+            runtime_contract=self.cache_pool.arena.runtime_contract,
+        )
+        cache.refresh_attention_page_tables()
+        return cache
 
     def _prepare_cache_group_tables(
         self,
@@ -1024,15 +1034,13 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=device,
             )
-        cache_metadata = DeepseekV4CacheMetadata.from_group_tables(
-            page_size=self.kernel_page_size,
+        cache_metadata = self._cache_metadata(
             page_table=page_table,
             block_tables={
                 str(gid): table[:bs].to(device=device, dtype=torch.int32)
                 for gid, table in block_tables.items()
             },
         )
-        self._prepare_cache_metadata(cache_metadata)
         req_ids = torch.arange(bs, device=device, dtype=torch.int32)
         num_prefill_tokens = sum(prefill_query_lens)
         if num_prefill_reqs == bs:
@@ -1115,10 +1123,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                     dtype=torch.int32,
                     device=metadata.seq_lens.device,
                 )
-                if self.dcp_size > 1 and self.dcp_rank != 0:
-                    attention_metadata.decode_dcp_zero_swa_lens = torch.zeros_like(
-                        attention_metadata.swa_lens
-                    )
+                attention_metadata.swa_lens_none = torch.zeros_like(
+                    attention_metadata.swa_lens
+                )
 
         cache_metadata = metadata.cache
         if cache_metadata.swa_page_table is None:
@@ -1165,10 +1172,11 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         if compress_ratio == 4:
             if topk_indices is None:
                 raise RuntimeError("DeepSeek V4 CSA decode requires top-k indices")
-            valid_lens = (
-                torch.empty(num_tokens, dtype=torch.int32, device=positions.device)
-                if self.dcp_size > 1
-                else None
+            # ``lens`` is the scan extent FlashMLA's frozen schedule needs;
+            # ``valid_lens`` counts the rows this rank actually owns, which the
+            # LSE merge uses to tell an empty shard from an attended one.
+            valid_lens = torch.empty(
+                num_tokens, dtype=torch.int32, device=positions.device
             )
             indices_2d, lens = dsv4_compute_global_topk_indices_and_lens(
                 topk_indices=topk_indices,
@@ -1210,11 +1218,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             out_lens=None,
         )
         indices = indices_2d.unsqueeze(1)
-        valid_lens = (
-            (indices_2d >= 0).sum(dim=1, dtype=torch.int32)
-            if self.dcp_size > 1
-            else None
-        )
+        valid_lens = (indices_2d >= 0).sum(dim=1, dtype=torch.int32)
         dense_indices_cache[cache_key] = (indices, lens, valid_lens)
         if capturing:
             capture_safe_keys.add(cache_key)
@@ -1227,12 +1231,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         alignment = DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT
         return ((width + alignment - 1) // alignment) * alignment
 
-    def _pad_decode_query(
-        self,
-        q: torch.Tensor,
-        *,
-        padded_heads: int,
-    ) -> torch.Tensor:
+    def _pad_decode_query(self, q: torch.Tensor) -> torch.Tensor:
         """Return a FlashMLA query with an invariant zero-padded head tail."""
         if q.ndim != 3:
             raise ValueError(
@@ -1240,42 +1239,27 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 f"[tokens, heads, head_dim], got {tuple(q.shape)}"
             )
         num_heads = q.shape[1]
-        if num_heads > padded_heads:
-            raise ValueError(
-                "DeepSeek V4 decode padded_heads must cover all local heads: "
-                f"local_heads={num_heads}, padded_heads={padded_heads}"
-            )
-        if num_heads == padded_heads:
+        if num_heads == dsv4_padded_heads(num_heads):
             return q.contiguous()
 
-        if self.graph is None:
-            raise RuntimeError(
-                "DeepSeek V4 decode query padding requires initialized decode state"
-            )
-        max_query_tokens = self.graph.max_bs * self.graph.max_tokens_per_req
-        if q.shape[0] > max_query_tokens:
-            raise ValueError(
-                "DeepSeek V4 decode query exceeds the persistent padding workspace: "
-                f"tokens={q.shape[0]}, capacity={max_query_tokens}"
-            )
-
-        layout = (
-            q.device,
-            q.dtype,
-            num_heads,
-            padded_heads,
-            q.shape[2],
-        )
-        workspace = self._decode_q_padding_workspace
+        workspace = self._decode_q_padding_workspaces.get(num_heads)
         if workspace is None:
             raise RuntimeError(
                 "DeepSeek V4 decode query padding workspace must be allocated "
-                "during decode-state initialization"
+                f"during decode-state initialization for {num_heads} heads"
             )
-        if layout != self._decode_q_padding_workspace_layout:
+        if q.shape[0] > workspace.shape[0]:
             raise ValueError(
-                "DeepSeek V4 decode query padding layout changed after allocation: "
-                f"expected={self._decode_q_padding_workspace_layout}, actual={layout}"
+                "DeepSeek V4 decode query exceeds the persistent padding workspace: "
+                f"tokens={q.shape[0]}, capacity={workspace.shape[0]}"
+            )
+        if (q.device, q.dtype, q.shape[2]) != (
+            workspace.device,
+            workspace.dtype,
+            workspace.shape[2],
+        ):
+            raise ValueError(
+                "DeepSeek V4 decode query layout differs from its padding workspace"
             )
         workspace_view = workspace[: q.shape[0]]
         workspace_view[:, :num_heads].copy_(q)
@@ -1348,21 +1332,20 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 f"metadata_tokens={metadata.token_to_req_indices.numel()}, "
                 f"q_tokens={q.shape[0]}"
             )
-        use_dcp = self.dcp_size > 1 and compress_ratio > 1
-        if use_dcp:
-            q = gather_query_heads(q, self.dcp_group)
-            actual_heads = q.shape[1]
-            kernel_heads = dsv4_padded_heads(actual_heads)
-            if actual_heads == kernel_heads:
-                q_padded = q.contiguous()
-            else:
-                workspace = self._decode_dcp_q_padding_workspace
-                if workspace is None or q.shape[0] > workspace.shape[0]:
-                    raise RuntimeError("DCP decode query exceeds its padding workspace")
-                q_padded = workspace[: q.shape[0]]
-                q_padded[:, :actual_heads].copy_(q)
-        else:
-            q_padded = self._pad_decode_query(q, padded_heads=padded_heads)
+        # A layer's attention group is the DCP group when its compressed cache
+        # is sharded and just this rank otherwise (SWA-only layers read the
+        # replicated SWA cache). Everything below is parameterized by that
+        # group; a group of one gathers, weights and combines nothing.
+        group = self._attention_group(compress_ratio)
+        degree = len(group)
+        q = gather_query_heads(q, group)
+        heads = q.shape[1]
+        q_padded = self._pad_decode_query(q)
+        if degree == 1 and q_padded.shape[1] != padded_heads:
+            raise ValueError(
+                "DeepSeek V4 decode sink width does not match the padded query: "
+                f"padded_heads={padded_heads}, query_heads={q_padded.shape[1]}"
+            )
         swa_block_size = token_to_kv_pool.swa_block_size
         attention_metadata = metadata.attention
         if (
@@ -1380,10 +1363,10 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 window_size=window_size,
                 block_size=swa_block_size,
             )
-        local_swa_lens = swa_lens
-        if use_dcp and self.dcp_rank != 0:
-            local_swa_lens = attention_metadata.decode_dcp_zero_swa_lens
-            assert local_swa_lens is not None
+        # The SWA cache is replicated: only the group's first rank counts it.
+        if degree > 1 and self.dcp_rank != 0:
+            swa_lens = attention_metadata.swa_lens_none
+            assert swa_lens is not None
         compressed_block_size = token_to_kv_pool.get_compressed_block_size(layer_id)
         extra_indices, extra_lens, valid_lens = (
             self._decode_compressed_attention_indices_and_lens(
@@ -1399,13 +1382,15 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         if compress_ratio > 1:
             compressed_cache_2d = token_to_kv_pool.get_compressed_kv_buffer_2d(layer_id)
 
+        # A partial over one shard is merged through its no-sink LSE; a group
+        # of one is the whole softmax and takes the sink in the kernel.
         result = dsv4_decode(
             q=q_padded,
             swa_kv_cache=token_to_kv_pool.get_swa_kv_buffer(layer_id),
             swa_slots=swa_indices,
-            swa_lens=local_swa_lens,
+            swa_lens=swa_lens,
             swa_page_size=swa_block_size,
-            attn_sink=None if use_dcp else attn_sink,
+            attn_sink=attn_sink if degree == 1 else None,
             softmax_scale=softmax_scale,
             extra_kv_cache=compressed_cache_2d,
             extra_slots=extra_indices,
@@ -1413,21 +1398,27 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             extra_page_size=(
                 compressed_block_size if compressed_cache_2d is not None else None
             ),
-            return_lse=use_dcp,
+            return_lse=degree > 1,
         )
-        if use_dcp:
-            partial, lse = result
-            partial, lse = normalize_dcp_partials(
-                partial, lse.squeeze(-1), local_swa_lens, valid_lens
-            )
-            return combine_attention_partials(
-                partial[:, :actual_heads],
-                lse[:, :actual_heads],
-                group=self.dcp_group,
-                rank=self.dcp_rank,
-                sink=attn_sink,
-            )
-        return result[:, :num_local_heads]
+        if degree == 1:
+            return result[:, :num_local_heads]
+        partial, lse = result
+        partial, lse = normalize_dcp_partials(
+            partial, lse.squeeze(-1), swa_lens, valid_lens
+        )
+        return combine_attention_partials(
+            partial[:, :heads],
+            lse[:, :heads],
+            group=group,
+            rank=self.dcp_rank,
+            sink=attn_sink,
+        )
+
+    def _attention_group(self, compress_ratio: int) -> tuple[int, ...]:
+        """Ranks whose cache shards one attention layer of ``compress_ratio`` spans."""
+        if compress_ratio > 1:
+            return self.dcp_group
+        return (self.dcp_group[self.dcp_rank],)
 
     def forward_deepseek_v4_mixed(
         self,
@@ -1611,24 +1602,30 @@ class DeepseekV4AttentionBackend(AttentionBackend):
     def _prepare_dcp_prefill_metadata(
         self, metadata: DeepseekV4ForwardMetadata
     ) -> None:
-        if self.dcp_size <= 1 or metadata.num_prefill_reqs <= 0:
-            return
+        """Plan the cross-rank history exchange of every sharded compressed group.
+
+        A group attended by one rank has nothing to exchange and gets no plan.
+        """
         metadata.dcp_prefill = {}
-        window_size = next(
-            spec.sliding_window_tokens
-            for spec in self.cache_pool.arena.runtime_contract.group_specs
-            if spec.group_id == V4_SWA_KV_GROUP_ID
-        )
+        if metadata.num_prefill_reqs <= 0:
+            return
         for group_id in metadata.cache.block_tables:
             ratio = parse_v4_compressed_kv_group_id(group_id)
-            if ratio is None:
+            if ratio is None or len(self._attention_group(ratio)) == 1:
                 continue
             metadata.dcp_prefill[ratio] = self._build_dcp_prefill_chunks(
                 metadata,
                 ratio,
                 chunk_size=self.prefill_chunk_size,
-                window_size=window_size,
+                window_size=self._swa_window_tokens(),
             )
+
+    def _swa_window_tokens(self) -> int:
+        """The SWA group's window from the bound arena's contract."""
+        for spec in self.cache_pool.arena.runtime_contract.group_specs:
+            if spec.group_id == V4_SWA_KV_GROUP_ID:
+                return int(spec.sliding_window_tokens)
+        raise RuntimeError("DeepSeek V4 cache contract declares no SWA group")
 
     def _gather_compressed_prefill(
         self,
@@ -1639,25 +1636,25 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         cache_2d: torch.Tensor,
         seq_lens: torch.Tensor,
         gather_lens: torch.Tensor | None,
-        block_table: torch.Tensor,
         block_size: int,
         offset: int,
         max_gather_len: int | None,
     ) -> None:
         """Dequantize local history, gather owned BF16 rows, and restore TP order."""
         chunk = None
-        if self.dcp_size > 1:
+        chunks = metadata.dcp_prefill.get(compress_ratio)
+        if chunks is not None:
             start = metadata.prefill_req_offset
-            chunk = metadata.dcp_prefill[compress_ratio][start, start + out.shape[0]]
+            chunk = chunks[start, start + out.shape[0]]
             if offset != 0 or out.shape[1] != chunk.workspace_width:
                 raise RuntimeError(
                     "DCP prefill workspace differs from its prepared layout"
                 )
-            # This read table already maps virtual pages to local physical pages;
-            # nonowners and missing pages are -1 and dequantize to zero.
-            block_table = metadata.cache.compressed_attention_page_table(
-                compress_ratio
-            )[: seq_lens.numel()]
+        # The read table maps virtual pages to local physical pages; pages of
+        # other owners and the null block are -1 and dequantize to zero.
+        block_table = metadata.cache.compressed_attention_page_table(compress_ratio)[
+            : seq_lens.numel()
+        ]
         dsv4_dequantize_and_gather_k_cache(
             out=out,
             cache_2d=cache_2d,
@@ -1731,7 +1728,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 cache_2d=compressed_cache,
                 seq_lens=compressed_lens,
                 gather_lens=None,
-                block_table=compressed_page_table,
                 block_size=compressed_block_size,
                 offset=0,
                 max_gather_len=compressed_base,
@@ -1784,7 +1780,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 cache_2d=compressed_cache,
                 seq_lens=compressed_lens,
                 gather_lens=None,
-                block_table=compressed_page_table,
                 block_size=compressed_block_size,
                 offset=0,
                 max_gather_len=compressed_base,
@@ -1907,21 +1902,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             torch.cumsum(query_lens.to(torch.int32), dim=0, dtype=torch.int32),
             (1, 0),
         )
-        sliced_cache = DeepseekV4CacheMetadata.from_group_tables(
-            page_size=cache_metadata.page_size,
-            page_table=cache_metadata.page_table[req_start:req_end],
-            block_tables={
-                key: table[req_start:req_end]
-                for key, table in cache_metadata.block_tables.items()
-            },
-        )
-        sliced_cache.dcp_size = cache_metadata.dcp_size
-        sliced_cache.dcp_rank = cache_metadata.dcp_rank
-        sliced_cache.runtime_contract = cache_metadata.runtime_contract
-        sliced_cache.compressed_attention_page_tables = {
-            group_id: table[req_start:req_end]
-            for group_id, table in cache_metadata.compressed_attention_page_tables.items()
-        }
+        sliced_cache = cache_metadata.slice_requests(req_start, req_end)
         return DeepseekV4ForwardMetadata(
             seq_lens=metadata.seq_lens[req_start:req_end],
             query_lens=query_lens,
@@ -2135,36 +2116,21 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             ),
             max_num_pages=self.max_num_pages,
             device=self.device,
+            dcp_size=self.dcp_size,
+            dcp_rank=self.dcp_rank,
+            runtime_contract=self.cache_pool.arena.runtime_contract,
         )
-        self._decode_q_padding_workspace = None
-        self._decode_q_padding_workspace_layout = None
-        padded_heads = dsv4_padded_heads(self.num_qo_heads)
-        if padded_heads != self.num_qo_heads:
-            self._decode_q_padding_workspace = torch.zeros(
-                (
-                    self.graph.max_bs * self.graph.max_tokens_per_req,
-                    padded_heads,
-                    self.head_dim,
-                ),
-                dtype=self.dtype,
-                device=self.device,
-            )
-            self._decode_q_padding_workspace_layout = (
-                self._decode_q_padding_workspace.device,
-                self._decode_q_padding_workspace.dtype,
-                self.num_qo_heads,
-                padded_heads,
-                self.head_dim,
-            )
-        self._decode_dcp_q_padding_workspace = None
-        if self.dcp_size > 1:
-            dcp_heads = self.num_qo_heads * self.dcp_size
-            dcp_padded_heads = dsv4_padded_heads(dcp_heads)
-            if dcp_heads != dcp_padded_heads:
-                self._decode_dcp_q_padding_workspace = torch.zeros(
+        # A layer attends over its TP-local heads, or over the DCP group's
+        # gathered heads when its cache is sharded; each width that FlashMLA
+        # must pad gets one zero-tailed persistent workspace.
+        self._decode_q_padding_workspaces = {}
+        for heads in {self.num_qo_heads, self.num_qo_heads * self.dcp_size}:
+            padded_heads = dsv4_padded_heads(heads)
+            if padded_heads != heads:
+                self._decode_q_padding_workspaces[heads] = torch.zeros(
                     (
                         self.graph.max_bs * self.graph.max_tokens_per_req,
-                        dcp_padded_heads,
+                        padded_heads,
                         self.head_dim,
                     ),
                     dtype=self.dtype,
@@ -2248,7 +2214,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             max_num_pages=self.max_num_pages,
             forward_mode=forward_mode,
         )
-        self._prepare_cache_metadata(metadata.cache)
+        metadata.cache.refresh_attention_page_tables()
         if is_packed_decode and self.is_draft:
             self._prepare_draft_round(
                 metadata,
@@ -2357,7 +2323,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         is_decode = forward_mode.is_decode()
         metadata.num_prefill_reqs = 0
         metadata.num_prefill_tokens = 0
-        self._prepare_cache_metadata(metadata.cache)
+        metadata.cache.refresh_attention_page_tables()
         if is_packed_decode and self.is_draft:
             self._prepare_draft_round(
                 metadata,

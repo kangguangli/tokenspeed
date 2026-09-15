@@ -113,13 +113,25 @@ def v4_compressor_state_spec(ratio: int, *, c4_state_window: int) -> CacheGroupS
 
 
 def v4_compressed_kv_spec(ratio: int) -> CacheGroupSpec:
-    """Compressed kv: full-history chain, shared with indexer K only at DCP1."""
+    """Compressed kv for one ratio: the full-history chain."""
     _check_ratio(ratio)
     return CacheGroupSpec(
         group_id=v4_compressed_kv_group_id(ratio),
         retention="full_history",
         rows_per_page=v4_compressed_rows_per_page(ratio),
         entry_stride_tokens=ratio,
+        sliding_window_tokens=None,
+        family="history",
+    )
+
+
+def v4_indexer_kv_spec() -> CacheGroupSpec:
+    """Indexer K: a replicated full-history chain over the ratio-4 layers."""
+    return CacheGroupSpec(
+        group_id=V4_INDEXER_KV_GROUP_ID,
+        retention="full_history",
+        rows_per_page=v4_compressed_rows_per_page(4),
+        entry_stride_tokens=4,
         sliding_window_tokens=None,
         family="history",
     )
@@ -227,21 +239,18 @@ class DeepseekV4Recipe(CacheRecipe):
 
     @property
     def dcp_size(self) -> int:
-        return getattr(self.attn_config, "dcp_size", 1)
+        """Owners of each compressed-KV virtual block; 1 keeps them replicated."""
+        return int(self.attn_config.dcp_size)
 
     @property
     @override
     def max_padding_fraction(self) -> float:
-        # Split groups use different subsets of the parent planes, so their
-        # padding fractions can exceed the original joined-group limit. Size
-        # the arena from the packed parent bytes and the actual cache budget.
-        return float("inf") if self.dcp_size > 1 else _MAX_PADDING_FRACTION
+        return _MAX_PADDING_FRACTION
 
     # ---- groups: declared whole, one walk over the layers ----
 
     @override
     def groups(self) -> tuple[CacheGroupDeclaration, ...]:
-        split_indexer = self.dcp_size > 1
         layout = self._cache_layout
         sliding_window = int(
             (
@@ -265,7 +274,6 @@ class DeepseekV4Recipe(CacheRecipe):
         c4_window = v4_c4_state_window(self.decode_input_tokens)
         swa_bytes = layout.swa_block_bytes(V4_KERNEL_BLOCK_ROWS)
         stride_alignment = layout.swa_token_stride
-        ratio_counts = Counter(ratios)
         declared: dict[str, CacheGroupDeclaration] = {}
         # A group's plane numbering: one plane per layer that stores in it.
         occurrences: Counter[str] = Counter()
@@ -336,14 +344,12 @@ class DeepseekV4Recipe(CacheRecipe):
             if ratio != 4:
                 continue
 
-            # Currently, DCP replicates the global indexer K across a separate group.
-            # This will be sharded soon.
-            indexer_slot = compressed_slot + (0 if split_indexer else ratio_counts[4])
-            indexer_spec = (
-                replace(compressed_spec, group_id=V4_INDEXER_KV_GROUP_ID, shard_count=1)
-                if split_indexer
-                else compressed_spec
-            )
+            # The indexer's K is its own replicated full-history group: the
+            # indexer reads every rank's rows, so it never follows the
+            # compressed chain's sharding. Its state is its own group too.
+            indexer_spec = v4_indexer_kv_spec()
+            indexer_slot = occurrences[indexer_spec.group_id]
+            occurrences[indexer_spec.group_id] += 1
             indexer_state_spec = v4_indexer_state_spec(c4_state_window=c4_window)
             indexer_state_slot = occurrences[indexer_state_spec.group_id]
             occurrences[indexer_state_spec.group_id] += 1

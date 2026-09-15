@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -72,11 +72,11 @@ from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
     CacheBatchMetadata,
 )
 from tokenspeed.runtime.layers.attention.configs.base import is_block_drafter
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
-    local_blocks,
-)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     validate_scheduler_config,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.virtual_blocks import (
+    local_blocks_by_group,
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 from tokenspeed.runtime.layers.paged_attention import (
@@ -339,6 +339,7 @@ class ModelExecutor:
             kv_pool=token_to_kv_pool,
         )
         self._cache_runtime_contract = token_to_kv_pool.arena.runtime_contract
+        self._cache_dcp_rank = model_runner.mapping.attn.dcp_rank
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self._draft_final_step_counter = None
@@ -1141,7 +1142,7 @@ class ModelExecutor:
                     spec_step_idx=step_idx,
                 )
 
-    def zero_cache_pages(self, pages: Mapping):
+    def zero_cache_pages(self, pages: Mapping[str, Sequence[int]] | Sequence[int]):
         """Clear newly owned pages and return a CUDA completion event when needed.
 
         Runs on ``default_stream``, ordered behind the forwards in flight on
@@ -1155,20 +1156,14 @@ class ModelExecutor:
             return None
         self.default_stream.wait_stream(self.execution_stream)
 
-        if self.model_runner.mapping.attn.has_dcp:
-            contract = self._cache_runtime_contract
-            specs = {spec.group_id: spec for spec in contract.group_specs}
-            counts = contract.virtual_block_counts
-            rank = self.model_runner.mapping.attn.dcp_rank
-            pages = {
-                group_id: local_blocks(
-                    block_ids,
-                    shard_count=specs[group_id].shard_count,
-                    rank=rank,
-                    virtual_block_count=counts[group_id],
-                )
-                for group_id, block_ids in pages.items()
-            }
+        if isinstance(pages, Mapping):
+            # Group-keyed requests carry scheduler (virtual) IDs; pools and the
+            # arena only ever see this rank's local pages.
+            pages = local_blocks_by_group(
+                pages,
+                contract=self._cache_runtime_contract,
+                rank=self._cache_dcp_rank,
+            )
 
         def sanitize(pool, pool_pages) -> bool:
             zero_new_blocks = getattr(pool, "zero_new_blocks", None)
