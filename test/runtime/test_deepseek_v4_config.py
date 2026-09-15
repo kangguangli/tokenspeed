@@ -21,6 +21,7 @@ register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.ops.attention.dsv4 import dsv4_padded_heads
 from tokenspeed_kernel.ops.attention.dsv4.cuda import (
     has_indexer_topk_prefill,
     indexer_topk_prefill,
@@ -2916,8 +2917,8 @@ class TestDeepseekV4Config(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exceeds.*workspace"):
             backend._pad_decode_query(torch.empty(9, 8, 4, dtype=torch.bfloat16))
         # A width no layer of this backend attends with has no workspace.
-        with self.assertRaisesRegex(RuntimeError, "for 16 heads"):
-            backend._pad_decode_query(torch.empty(1, 16, 4, dtype=torch.bfloat16))
+        with self.assertRaisesRegex(RuntimeError, "for 24 heads"):
+            backend._pad_decode_query(torch.empty(1, 24, 4, dtype=torch.bfloat16))
 
     def test_deepseek_v4_decode_query_padding_covers_dcp_gathered_heads(self):
         backend = _v4_backend(
@@ -2940,11 +2941,18 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
         backend.init_cuda_graph_state(max_bs=4, max_tokens_per_req=1)
         # TP-local 8 heads for SWA-only layers, 16 gathered heads for sharded
-        # layers; FlashMLA pads both to 64.
-        self.assertEqual(set(backend._decode_q_padding_workspaces), {8, 16})
+        # layers; each width the platform's kernels pad gets a workspace
+        # (FlashMLA pads both to 64, GFX950 accepts 16 natively).
+        padded_widths = {
+            heads for heads in (8, 16) if dsv4_padded_heads(heads) != heads
+        }
+        self.assertEqual(set(backend._decode_q_padding_workspaces), padded_widths)
         gathered = backend._pad_decode_query(torch.ones(2, 16, 4, dtype=torch.bfloat16))
-        self.assertEqual(gathered.shape, (2, 64, 4))
+        self.assertEqual(gathered.shape, (2, dsv4_padded_heads(16), 4))
         self.assertTrue(torch.count_nonzero(gathered[:, 16:]) == 0)
+        self.assertTrue(
+            torch.equal(gathered[:, :16], torch.ones(2, 16, 4, dtype=torch.bfloat16))
+        )
         self.assertEqual(backend._attention_group(4), (0, 1))
         self.assertEqual(backend._attention_group(1), (1,))
 
