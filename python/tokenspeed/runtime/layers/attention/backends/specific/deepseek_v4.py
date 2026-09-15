@@ -1413,7 +1413,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             extra_page_size=(
                 compressed_block_size if compressed_cache_2d is not None else None
             ),
-            return_lse=True if use_dcp else None,
+            return_lse=use_dcp,
         )
         if use_dcp:
             partial, lse = result
