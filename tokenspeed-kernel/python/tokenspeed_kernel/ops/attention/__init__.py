@@ -3943,7 +3943,7 @@ def dsv4_decode(
             returned output is this same tensor, including with return_lse=True.
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
-        return_lse: Return a partial and its natural-log LSE. Notice that whether 
+        return_lse: Return a partial and its natural-log LSE. Notice that whether
             the returned lse includes attn sink depends on the backend.
     Returns:
         BF16 attention output shaped like ``q``. With return_lse=True, also

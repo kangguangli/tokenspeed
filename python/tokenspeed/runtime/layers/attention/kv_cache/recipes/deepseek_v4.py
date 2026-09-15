@@ -336,8 +336,9 @@ class DeepseekV4Recipe(CacheRecipe):
             if ratio != 4:
                 continue
 
-            # DCP keeps global indexer K replicated in an independent group.
-            # Its field rows and plane numbering retain the DCP1 geometry.
+            # Currently, DCP replicates the global indexer K across a separate group.
+            # This will be sharded soon.
+            indexer_slot = compressed_slot + (0 if split_indexer else ratio_counts[4])
             indexer_spec = (
                 replace(compressed_spec, group_id=V4_INDEXER_KV_GROUP_ID, shard_count=1)
                 if split_indexer
@@ -350,7 +351,7 @@ class DeepseekV4Recipe(CacheRecipe):
                 indexer_spec,
                 CacheFieldSpec(
                     f"layer.{layer_id}.indexer_kv",
-                    f"unit.{ratio_counts[4] + compressed_slot}",
+                    f"unit.{indexer_slot}",
                     (V4_KERNEL_BLOCK_ROWS * layout.indexer_row_bytes,),
                     "uint8",
                     exact_page_stride=False,
