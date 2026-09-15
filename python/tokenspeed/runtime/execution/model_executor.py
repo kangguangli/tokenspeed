@@ -339,7 +339,6 @@ class ModelExecutor:
             kv_pool=token_to_kv_pool,
         )
         self._cache_runtime_contract = token_to_kv_pool.arena.runtime_contract
-        self._cache_dcp_rank = model_runner.mapping.attn.dcp_rank
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self._draft_final_step_counter = None
@@ -355,6 +354,9 @@ class ModelExecutor:
             state_write_padding_pool_index=config.max_req_pool_size,
             device=self.device,
         )
+        # Group-keyed zeroing requests carry scheduler (virtual) block IDs; this
+        # rank's position in the DCP group selects the pages it owns.
+        self._cache_dcp_rank = model_runner.mapping.attn.dcp_rank
         ngram_context = engram_context_len(model_runner.model_config.hf_text_config)
         if ngram_context and (config.pp_size != 1 or config.overlap_schedule_depth > 1):
             raise NotImplementedError(
